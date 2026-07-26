@@ -10,6 +10,34 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QFont
 
+class ExportWorker(QThread):
+    progress = Signal(int, str)
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, export_mgr, kwargs: Dict[str, Any]):
+        super().__init__()
+        self.export_mgr = export_mgr
+        self.kwargs = kwargs
+
+    def run(self):
+        try:
+            self.progress.emit(15, "Preparing project & audio tracks...")
+            time.sleep(0.3)
+            self.progress.emit(35, "Mixing BGM & AI Khmer Voice dubbing tracks...")
+            time.sleep(0.3)
+            self.progress.emit(60, "FFmpeg rendering video & burning subtitles...")
+
+            success = self.export_mgr.export_video(**self.kwargs)
+            if success:
+                self.progress.emit(100, "Export Completed Successfully!")
+                self.finished.emit(self.kwargs["output_video_path"])
+            else:
+                self.failed.emit("FFmpeg failed to render output video.")
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 class ExportSettingsDialog(QDialog):
     def __init__(self, default_video_path: str, duration_ms: int = 60000, parent=None):
         super().__init__(parent)

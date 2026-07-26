@@ -1,9 +1,10 @@
 import os
+import re
 from typing import List, Optional
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QLabel, QPushButton, QFileDialog, QProgressBar, QStatusBar,
-    QMessageBox, QSlider, QFrame, QMenu, QMenuBar, QComboBox
+    QMessageBox, QSlider, QFrame, QMenu, QMenuBar, QComboBox, QDialog
 )
 from PySide6.QtCore import Qt, QUrl, QTimer, QSize, Signal
 from PySide6.QtGui import QIcon, QFont, QDragEnterEvent, QDropEvent
@@ -659,7 +660,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Export Video", "Please load a video and prepare subtitles first.")
             return
 
-        from .export_dialog import ExportSettingsDialog, RenderProgressDialog
+        from .export_dialog import ExportSettingsDialog, RenderProgressDialog, ExportWorker
         settings_dlg = ExportSettingsDialog(
             default_video_path=self.current_project.video_path,
             duration_ms=self.video_player.player.duration(),
@@ -671,9 +672,8 @@ class MainWindow(QMainWindow):
         cfg = settings_dlg.get_export_config()
         save_path = cfg["output_path"]
 
-        progress_dlg = RenderProgressDialog(save_path, self)
-        progress_dlg.show()
-        progress_dlg.update_progress(15, "Preparing project & canvas settings...")
+        self.export_progress_dlg = RenderProgressDialog(save_path, self)
+        self.export_progress_dlg.show()
 
         # Extract Logo and Blur configuration from interactive VideoOverlayCanvas
         canvas = self.video_player.overlay_canvas
@@ -708,27 +708,24 @@ class MainWindow(QMainWindow):
         vol_match = re.search(r'\d+', self.video_player.combo_orig_vol.currentText())
         orig_vol_pct = int(vol_match.group()) if vol_match else 20
 
-        progress_dlg.update_progress(45, "Encoding video & burning subtitles with FFmpeg...")
-        
-        success = self.export_mgr.export_video(
-            video_path=self.current_project.video_path,
-            subtitles=self.subtitles,
-            output_video_path=save_path,
-            style_config=self._get_style_config(),
-            logo_config=logo_cfg,
-            blur_config=blur_cfg,
-            mute_original_audio=self.video_player.btn_duck_bg.isChecked(),
-            audio_offset_ms=offset_ms,
-            aspect_ratio=cfg["preset"],
-            orig_audio_vol_pct=orig_vol_pct
-        )
+        export_args = {
+            "video_path": self.current_project.video_path,
+            "subtitles": self.subtitles,
+            "output_video_path": save_path,
+            "style_config": self._get_style_config(),
+            "logo_config": logo_cfg,
+            "blur_config": blur_cfg,
+            "mute_original_audio": self.video_player.btn_duck_bg.isChecked(),
+            "audio_offset_ms": offset_ms,
+            "aspect_ratio": cfg["preset"],
+            "orig_audio_vol_pct": orig_vol_pct
+        }
 
-        if success:
-            progress_dlg.set_completed()
-            self.status_bar.showMessage(f"Video Export Complete: {save_path}")
-        else:
-            progress_dlg.reject()
-            QMessageBox.critical(self, "Export Failed", f"FFmpeg failed to render video to:\n{save_path}")
+        self.export_render_worker = ExportWorker(self.export_mgr, export_args)
+        self.export_render_worker.progress.connect(self.export_progress_dlg.update_progress)
+        self.export_render_worker.finished.connect(lambda path: (self.export_progress_dlg.set_completed(), self.status_bar.showMessage(f"Export Completed: {path}")))
+        self.export_render_worker.failed.connect(lambda err: (self.export_progress_dlg.reject(), QMessageBox.critical(self, "Export Failed", f"Render failed: {err}")))
+        self.export_render_worker.start()
 
     def closeEvent(self, event):
         for attr in ["whisper_worker", "audio_extract_worker", "translator_worker", "tts_worker"]:
