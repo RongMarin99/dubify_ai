@@ -79,6 +79,7 @@ class AudioSeparationWorker(QThread):
 
 class FFmpegManager:
     def __init__(self, ffmpeg_path: str = "ffmpeg"):
+        self.last_error = ""
         if shutil.which(ffmpeg_path):
             self.ffmpeg_path = ffmpeg_path
         else:
@@ -170,6 +171,25 @@ class FFmpegManager:
             pass
         return 60000  # Default 60s fallback for UI display
 
+    def get_video_dimensions(self, media_path: str) -> Tuple[int, int]:
+        """Get video width and height in pixels via ffprobe."""
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=s=x:p=0",
+            media_path
+        ]
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if res.returncode == 0 and res.stdout.strip():
+                parts = res.stdout.strip().split("x")
+                if len(parts) >= 2:
+                    return int(parts[0]), int(parts[1])
+        except Exception:
+            pass
+        return 1920, 1080
+
     def generate_waveform_points(self, wav_path: str, num_points: int = 100) -> List[float]:
         """Generate normalized amplitude waveform data for UI timeline rendering."""
         try:
@@ -211,55 +231,89 @@ class FFmpegManager:
     ) -> bool:
         """Burn subtitles, logo overlay, blur mask, aspect ratio, and dynamic original audio volume into output video."""
         cmd = [self.ffmpeg_path, "-y", "-i", video_path]
+        next_input_idx = 1
 
-        # Add logo input file if provided
+        # Check logo input file
         logo_path = (logo_config or {}).get("path", "")
-        has_logo = logo_config and logo_config.get("enabled", False) and logo_path and os.path.exists(logo_path)
+        has_logo = bool(logo_config and logo_config.get("enabled", False) and logo_path and os.path.exists(logo_path))
+        logo_input_idx = -1
         if has_logo:
             cmd.extend(["-i", logo_path])
+            logo_input_idx = next_input_idx
+            next_input_idx += 1
 
-        # Normalize windows path separators for ffmpeg subtitle filter
-        sub_escaped = subtitle_path.replace("\\", "/").replace(":", "\\:")
+        # Check dubbed audio input file
+        has_dubbed = bool(dubbed_audio_path and os.path.exists(dubbed_audio_path))
+        dubbed_input_idx = -1
+        if has_dubbed:
+            cmd.extend(["-i", dubbed_audio_path])
+            dubbed_input_idx = next_input_idx
+            next_input_idx += 1
 
-        filters = []
+        # Relative or escaped subtitle path for libass subtitles filter
+        # Format as filename='...' to prevent FFmpeg from mistaking drive letter (C:, F:) for image size option
+        try:
+            sub_rel_path = os.path.relpath(subtitle_path, start=os.getcwd()).replace("\\", "/")
+        except Exception:
+            sub_rel_path = subtitle_path.replace("\\", "/")
 
-        # 1. Blur filter (delogo)
+        if ":" in sub_rel_path:
+            sub_clean = os.path.abspath(subtitle_path).replace("\\", "/")
+            sub_arg = f"filename='{sub_clean.replace(':', '\\:')}'"
+        else:
+            sub_arg = f"filename='{sub_rel_path.replace(':', '\\:')}'"
+
+        filter_complex_parts = []
+        cur_v_label = "[0:v]"
+
+        # 1. Blur filter (Gaussian / BoxBlur for Drama & Chinese Hardcoded Subtitles)
         if blur_config and blur_config.get("enabled", False):
             bx = blur_config.get("x", 0.10)
             by = blur_config.get("y", 0.80)
             bw = blur_config.get("w", 0.80)
             bh = blur_config.get("h", 0.12)
-            filters.append(f"delogo=x=in_w*{bx:.3f}:y=in_h*{by:.3f}:w=in_w*{bw:.3f}:h=in_h*{bh:.3f}")
+            blur_radius = blur_config.get("radius", 22)
+            vw, vh = self.get_video_dimensions(video_path)
+            x_px = max(0, int(vw * bx))
+            y_px = max(0, int(vh * by))
+            w_px = max(1, min(vw - x_px, int(vw * bw)))
+            h_px = max(1, min(vh - y_px, int(vh * bh)))
+            # Crop subtitle area, apply Gaussian Box Blur radius, and overlay onto video
+            filter_complex_parts.append(
+                f"{cur_v_label}crop={w_px}:{h_px}:{x_px}:{y_px},boxblur=luma_radius={blur_radius}:luma_power=2:chroma_radius={blur_radius}:chroma_power=2[b_crop];"
+                f"{cur_v_label}[b_crop]overlay={x_px}:{y_px}[v_blur]"
+            )
+            cur_v_label = "[v_blur]"
 
         # 2. Logo overlay filter
-        if has_logo:
+        if has_logo and logo_input_idx != -1:
             lx = logo_config.get("x", 0.05)
             ly = logo_config.get("y", 0.05)
             lw = logo_config.get("w", 0.20)
             lh = logo_config.get("h", 0.12)
-            filters.append(f"[1:v]scale=eval=frame:w=main_w*{lw:.3f}:h=main_h*{lh:.3f}[logo];[0:v][logo]overlay=x=main_w*{lx:.3f}:y=main_h*{ly:.3f}")
+            filter_complex_parts.append(f"[{logo_input_idx}:v]scale=eval=frame:w=main_w*{lw:.3f}:h=main_h*{lh:.3f}[logo_scaled]")
+            filter_complex_parts.append(f"{cur_v_label}[logo_scaled]overlay=x=main_w*{lx:.3f}:y=main_h*{ly:.3f}[v_logo]")
+            cur_v_label = "[v_logo]"
 
-        # 3. Aspect Ratio Scale & Pad Filter (if target ratio selected)
+        # 3. Aspect Ratio Scale & Pad Filter
         if aspect_ratio == "9:16 (Portrait)":
-            filters.append("scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black")
+            filter_complex_parts.append(f"{cur_v_label}scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black[v_aspect]")
+            cur_v_label = "[v_aspect]"
         elif aspect_ratio == "16:9 (Landscape)":
-            filters.append("scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black")
+            filter_complex_parts.append(f"{cur_v_label}scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black[v_aspect]")
+            cur_v_label = "[v_aspect]"
         elif aspect_ratio == "1:1 (Square)":
-            filters.append("scale=1080:1080:force_original_aspect_ratio=decrease,pad=1080:1080:(ow-iw)/2:(oh-ih)/2:black")
+            filter_complex_parts.append(f"{cur_v_label}scale=1080:1080:force_original_aspect_ratio=decrease,pad=1080:1080:(ow-iw)/2:(oh-ih)/2:black[v_aspect]")
+            cur_v_label = "[v_aspect]"
         elif aspect_ratio == "4:5 (Vertical)":
-            filters.append("scale=1080:1350:force_original_aspect_ratio=decrease,pad=1080:1350:(ow-iw)/2:(oh-ih)/2:black")
+            filter_complex_parts.append(f"{cur_v_label}scale=1080:1350:force_original_aspect_ratio=decrease,pad=1080:1350:(ow-iw)/2:(oh-ih)/2:black[v_aspect]")
+            cur_v_label = "[v_aspect]"
 
         # 4. Subtitles filter
-        filters.append(f"subtitles='{sub_escaped}'")
+        filter_complex_parts.append(f"{cur_v_label}subtitles={sub_arg}[vout]")
 
-        vf_graph = ",".join(filters)
-
-        audio_input_idx = 2 if has_logo else 1
-
-        # Dynamic Original Audio Volume Factor (0% to 100%)
+        # 5. Audio Filtering & Mixing (Boosted Dubbed TTS Speech + EBU R128 Loudness Normalization)
         vol_factor = max(0.0, min(1.0, orig_audio_vol_pct / 100.0))
-
-        # Speech-gated audio ducking: Duck original audio ONLY during spoken dialogue intervals
         duck_exprs = []
         if subtitles and mute_original_audio:
             for s in subtitles:
@@ -270,24 +324,38 @@ class FFmpegManager:
 
         if duck_exprs:
             enable_cond = "+".join(duck_exprs)
-            vol_filter = f"volume='if({enable_cond},{vol_factor:.2f},1.0)':eval=frame"
+            vol_filter = f"aformat=sample_rates=44100:channel_layouts=stereo,volume='if({enable_cond},{vol_factor:.2f},1.0)':eval=frame"
         else:
-            vol_filter = f"volume={vol_factor:.2f}" if mute_original_audio else "volume=1.0"
+            vol_filter = f"aformat=sample_rates=44100:channel_layouts=stereo,volume={vol_factor:.2f}" if mute_original_audio else "aformat=sample_rates=44100:channel_layouts=stereo,volume=1.0"
 
-        if dubbed_audio_path and os.path.exists(dubbed_audio_path):
-            filter_audio = f"[0:a]{vol_filter}[bg];[{audio_input_idx}:a]volume=1.0[dub];[bg][dub]amix=inputs=2:duration=first:dropout_transition=0[aout]"
-            cmd.extend(["-c:v", "libx264", "-vf", vf_graph, "-filter_complex", filter_audio, "-map", "0:v:0", "-map", "[aout]", "-c:a", "aac"])
+        filter_complex_parts.append(f"[0:a]{vol_filter}[bg_a]")
+
+        if has_dubbed and dubbed_input_idx != -1:
+            filter_complex_parts.append(f"[{dubbed_input_idx}:a]aformat=sample_rates=44100:channel_layouts=stereo,volume=2.0[dub_a]")
+            filter_complex_parts.append(f"[bg_a][dub_a]amix=inputs=2:weights='1 2.2':normalize=0:duration=first:dropout_transition=0[amix_raw]")
+            filter_complex_parts.append(f"[amix_raw]loudnorm=I=-14:TP=-1.0:LRA=11[aout]")
         else:
-            if mute_original_audio:
-                filter_audio = f"[0:a]{vol_filter}[aout]"
-                cmd.extend(["-c:v", "libx264", "-vf", vf_graph, "-filter_complex", filter_audio, "-map", "0:v:0", "-map", "[aout]", "-c:a", "aac"])
-            else:
-                cmd.extend(["-c:v", "libx264", "-vf", vf_graph, "-c:a", "copy"])
+            filter_complex_parts.append(f"[bg_a]loudnorm=I=-14:TP=-1.0:LRA=11[aout]")
 
-        cmd.append(output_video_path)
+        full_filter_complex = ";".join(filter_complex_parts)
+
+        cmd.extend([
+            "-filter_complex", full_filter_complex,
+            "-map", "[vout]",
+            "-map", "[aout]",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "22",
+            "-c:a", "aac", "-b:a", "192k",
+            output_video_path
+        ])
 
         try:
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            return res.returncode == 0
-        except Exception:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if res.returncode != 0:
+                self.last_error = f"FFmpeg Error (code {res.returncode}): {res.stderr.strip()}"
+                print(f"[FFmpeg Export Error] returncode={res.returncode}:\n{res.stderr}")
+                return False
+            return True
+        except Exception as e:
+            self.last_error = f"FFmpeg Exception: {str(e)}"
+            print(f"[FFmpeg Exception]: {e}")
             return False

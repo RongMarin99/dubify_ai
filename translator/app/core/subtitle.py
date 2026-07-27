@@ -55,13 +55,16 @@ class SubtitleParser:
         style_config: Optional[Dict[str, Any]] = None
     ):
         cfg = style_config or {}
-        font_name = cfg.get("font_name", "Segoe UI")
-        font_size = cfg.get("font_size", 24)
+        font_name = cfg.get("font_name", "Khmer OS Battambang")
+        font_size = int(cfg.get("font_size", 24))
         primary_hex = cfg.get("primary_color", "#FFFFFF")
         outline_hex = cfg.get("outline_color", "#000000")
-        outline_w = cfg.get("outline_width", 2)
+        bg_hex = cfg.get("bg_color", "#000000")
+        outline_w = int(cfg.get("outline_width", 2))
+        shadow_w = int(cfg.get("shadow_width", 1))
         bold_val = 1 if cfg.get("bold", True) else 0
         italic_val = 1 if cfg.get("italic", False) else 0
+        use_bg_box = cfg.get("use_bg_box", False)
 
         align_map = {
             "Bottom Center": 2, "Bottom Left": 1, "Bottom Right": 3,
@@ -69,18 +72,27 @@ class SubtitleParser:
         }
         align_val = align_map.get(cfg.get("alignment", "Bottom Center"), 2)
 
+        # Compute vertical margin from sub_y_pct (assuming 1080p ASS PlayResY)
+        sub_y_pct = float(cfg.get("sub_y_pct", 0.85))
+        margin_v = max(10, min(1000, int((1.0 - sub_y_pct) * 1080)))
+
         pri_ass = hex_to_ass_color(primary_hex)
         out_ass = hex_to_ass_color(outline_hex)
+        back_ass = hex_to_ass_color(bg_hex)
+
+        border_style = 3 if use_bg_box else 1  # 3 = opaque box, 1 = outline + shadow
 
         header = f"""[Script Info]
-Title: Dubify Studio Generated Subtitles
+Title: Dubify Studio Professional Subtitles
 ScriptType: v4.00+
 WrapStyle: 0
+PlayResX: 1920
+PlayResY: 1080
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{font_name},{font_size},{pri_ass},&H000000FF,{out_ass},&H00000000,{bold_val},{italic_val},0,0,100,100,0,0,1,{outline_w},1,{align_val},10,10,10,1
+Style: Default,{font_name},{font_size},{pri_ass},&H000000FF,{out_ass},{back_ass},{bold_val},{italic_val},0,0,100,100,0,0,{border_style},{outline_w},{shadow_w},{align_val},20,20,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -91,4 +103,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 start_tc = SubtitleItem.ms_to_timecode(item.start_ms)[:10]
                 end_tc = SubtitleItem.ms_to_timecode(item.end_ms)[:10]
                 text = (item.tgt_text if use_target and item.tgt_text else item.src_text) or ""
-                f.write(f"Dialogue: 0,{start_tc},{end_tc},Default,,0,0,0,,{text}\n")
+                # Replace newlines with ASS \N for 2-line auto wrapping
+                text_ass = text.replace("\n", "\\N")
+                f.write(f"Dialogue: 0,{start_tc},{end_tc},Default,,0,0,0,,{text_ass}\n")

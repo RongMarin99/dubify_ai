@@ -4,12 +4,13 @@ from typing import List, Optional
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QLabel, QPushButton, QFileDialog, QProgressBar, QStatusBar,
-    QMessageBox, QSlider, QFrame, QMenu, QMenuBar, QComboBox, QDialog
+    QMessageBox, QSlider, QFrame, QMenu, QMenuBar, QComboBox, QDialog,
+    QGraphicsView, QGraphicsScene, QColorDialog
 )
-from PySide6.QtCore import Qt, QUrl, QTimer, QSize, Signal
-from PySide6.QtGui import QIcon, QFont, QDragEnterEvent, QDropEvent
+from PySide6.QtCore import Qt, QUrl, QTimer, QSize, Signal, QRectF
+from PySide6.QtGui import QIcon, QFont, QDragEnterEvent, QDropEvent, QPainter, QColor
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtMultimediaWidgets import QVideoWidget, QGraphicsVideoItem
 
 from .editor import SubtitleEditorWidget
 from .timeline import TimelineWidget
@@ -59,29 +60,36 @@ class VideoPlayerWidget(QFrame):
 
         layout.addLayout(header_bar)
 
-        # Video Container Frame (Stack VideoWidget + OverlayCanvas)
+        # Video Container Frame (QGraphicsView + QGraphicsScene Architecture - 100% On-Top Overlay)
         self.video_container = QWidget()
         self.video_container.setStyleSheet("background-color: #0b0a14; border-radius: 4px;")
         
         container_layout = QVBoxLayout(self.video_container)
         container_layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.video_widget = QVideoWidget(self.video_container)
-        container_layout.addWidget(self.video_widget)
-        
-        self.overlay_canvas = VideoOverlayCanvas(self.video_container)
-        self.overlay_canvas.raise_()
+
+        self.video_scene = QGraphicsScene(0, 0, 985, 426, self)
+        self.video_view = QGraphicsView(self.video_scene, self.video_container)
+        self.video_view.setStyleSheet("background-color: #0b0a14; border: none;")
+        self.video_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.video_view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.video_view.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        container_layout.addWidget(self.video_view)
+
+        self.video_item = QGraphicsVideoItem()
+        self.video_item.setZValue(0)
+        self.video_scene.addItem(self.video_item)
+
+        self.overlay_canvas = VideoOverlayCanvas()
+        self.overlay_proxy = self.video_scene.addWidget(self.overlay_canvas)
+        self.overlay_proxy.setZValue(9999)
 
         layout.addWidget(self.video_container, stretch=1)
 
-        # Media Player & Audio Output
-        self.player = QMediaPlayer()
-        self.audio_output = QAudioOutput()
         # Media Player & Audio Output for Main Video
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.player.setAudioOutput(self.audio_output)
-        self.player.setVideoOutput(self.video_widget)
+        self.player.setVideoOutput(self.video_item)
 
         # Media Player & Audio Output for Generated Khmer TTS Audio Preview
         self.tts_player = QMediaPlayer()
@@ -108,7 +116,10 @@ class VideoPlayerWidget(QFrame):
 
         self.btn_logo = QPushButton("🖼️ Logo")
         self.btn_add_blur = QPushButton("➕ Add Blur")
+        self.btn_add_blur.setCheckable(True)
         self.btn_add_blur.setObjectName("PrimaryBtn")
+        self.overlay_canvas.blur_changed.connect(self._on_blur_changed)
+        self.overlay_canvas.blur_color_requested.connect(self._on_pick_blur_color)
         self.btn_add_sub = QPushButton("➕ Add Subtitle")
         self.btn_add_sub.setObjectName("ActionBtn")
         self.btn_duck_bg = QPushButton("🔉 Speech Ducking")
@@ -165,20 +176,70 @@ class VideoPlayerWidget(QFrame):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if hasattr(self, 'overlay_canvas') and hasattr(self, 'video_container'):
-            w = max(10, self.video_container.width())
-            h = max(10, self.video_container.height())
-            self.overlay_canvas.setGeometry(0, 0, w, h)
-            self.overlay_canvas.raise_()
+        if hasattr(self, 'overlay_canvas') and hasattr(self, 'video_scene'):
+            w = max(10, self.video_view.width())
+            h = max(10, self.video_view.height())
+            self.video_scene.setSceneRect(0, 0, w, h)
+            self.video_item.setSize(QSize(w, h))
+            self.overlay_canvas.resize(w, h)
+            self.overlay_proxy.setGeometry(QRectF(0, 0, w, h))
+            self.overlay_proxy.setZValue(9999)
 
     def _on_select_logo(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Logo / Watermark Image", "", "Image Files (*.png *.jpg *.jpeg)")
         if path:
+            w = max(10, self.video_view.width())
+            h = max(10, self.video_view.height())
+            self.video_scene.setSceneRect(0, 0, w, h)
+            self.video_item.setSize(QSize(w, h))
+            self.overlay_canvas.resize(w, h)
+            self.overlay_proxy.setGeometry(QRectF(0, 0, w, h))
+            self.overlay_proxy.setZValue(9999)
             self.overlay_canvas.load_logo(path)
+            self.overlay_canvas.show()
+
+    def _on_pick_blur_color(self):
+        current_col = QColor(self.overlay_canvas.blur_color)
+        current_col.setAlphaF(self.overlay_canvas.blur_opacity)
+        col = QColorDialog.getColor(
+            current_col,
+            self,
+            "Select Blur Mask Color & Transparency",
+            QColorDialog.ShowAlphaChannel
+        )
+        if col.isValid():
+            hex_code = col.name(QColor.HexRgb)
+            alpha = col.alphaF()
+            self.overlay_canvas.set_blur_color(hex_code, alpha)
+            print(f"[DEBUG LOG] Blur color updated | color={hex_code} | opacity={alpha:.2f}")
+
+    def _on_blur_changed(self, x, y, w, h, enabled):
+        self.btn_add_blur.setChecked(enabled)
+        if enabled:
+            self.btn_add_blur.setStyleSheet("background-color: #6c5ce7; color: #ffffff; font-weight: bold; border-radius: 4px; padding: 5px 12px; border: 1px solid #a29bfe;")
+        else:
+            self.btn_add_blur.setStyleSheet("")
 
     def _on_add_blur(self):
-        self.overlay_canvas.add_blur_region()
-        self.overlay_canvas.raise_()
+        is_active = not self.overlay_canvas.blur_enabled
+        w = max(10, self.video_view.width())
+        h = max(10, self.video_view.height())
+        self.video_scene.setSceneRect(0, 0, w, h)
+        self.video_item.setSize(QSize(w, h))
+        self.overlay_canvas.resize(w, h)
+        self.overlay_proxy.setGeometry(QRectF(0, 0, w, h))
+        self.overlay_proxy.setZValue(9999)
+        
+        if is_active:
+            self.overlay_canvas.add_blur_region()
+            self.overlay_canvas.show()
+        else:
+            self.overlay_canvas.set_blur_enabled(False)
+
+        self._on_blur_changed(0, 0, 0, 0, is_active)
+        self.overlay_canvas.update()
+        self.video_scene.update()
+        self.video_view.viewport().update()
 
     def _on_add_subtitle(self):
         active_text = ""
@@ -187,8 +248,17 @@ class VideoPlayerWidget(QFrame):
             if sub.start_ms <= pos <= sub.end_ms:
                 active_text = sub.tgt_text if sub.tgt_text else sub.src_text
                 break
+        w = max(10, self.video_view.width())
+        h = max(10, self.video_view.height())
+        self.video_scene.setSceneRect(0, 0, w, h)
+        self.video_item.setSize(QSize(w, h))
+        self.overlay_canvas.resize(w, h)
+        self.overlay_proxy.setGeometry(QRectF(0, 0, w, h))
+        self.overlay_proxy.setZValue(9999)
         self.overlay_canvas.add_subtitle_object(active_text)
-        self.overlay_canvas.raise_()
+        self.overlay_canvas.show()
+        self.overlay_canvas.update()
+        self.video_scene.update()
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -411,11 +481,22 @@ class MainWindow(QMainWindow):
         # Status Bar
         self.status_bar = QStatusBar()
         self.status_bar.showMessage("Ready.")
+
+        self.lbl_stt_badge = QLabel()
+        self.lbl_stt_badge.setStyleSheet("color: #60a5fa; font-weight: 600; padding: 0 8px; border-left: 1px solid #3f3f4e;")
+        self.lbl_trans_badge = QLabel()
+        self.lbl_trans_badge.setStyleSheet("color: #34d399; font-weight: 600; padding: 0 8px; border-left: 1px solid #3f3f4e;")
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setFixedWidth(180)
         self.progress_bar.hide()
+
+        self.status_bar.addPermanentWidget(self.lbl_stt_badge)
+        self.status_bar.addPermanentWidget(self.lbl_trans_badge)
         self.status_bar.addPermanentWidget(self.progress_bar)
         self.setStatusBar(self.status_bar)
+
+        self._update_status_bar_badges()
 
         # Connect Signals
         self.video_player.video_loaded.connect(self._on_video_loaded)
@@ -423,6 +504,8 @@ class MainWindow(QMainWindow):
         self.subtitle_editor.row_selected.connect(self.video_player.seek)
         self.subtitle_editor.subtitle_changed.connect(self._on_subtitles_changed)
         self.subtitle_editor.style_clicked.connect(self._open_style_dialog)
+        self.video_player.overlay_canvas.style_edit_requested.connect(self._open_style_dialog)
+        self.video_player.overlay_canvas.delete_sub_requested.connect(self._delete_active_subtitle)
         self.timeline_widget.seek_requested.connect(self.video_player.seek)
         self.timeline_widget.generate_transcript_clicked.connect(self._start_transcription)
         self.timeline_widget.translate_clicked.connect(self._start_translation)
@@ -436,10 +519,24 @@ class MainWindow(QMainWindow):
         self.btn_add_batch.clicked.connect(lambda: QMessageBox.information(self, "Batch Queue", "Added project to Batch Queue."))
         self.btn_batch_proc.clicked.connect(lambda: QMessageBox.information(self, "Batch Processing", "Batch Processing Manager ready for multi-episode queue."))
 
+        # Load stored subtitle style from database into overlay canvas
+        self.video_player.overlay_canvas.load_style_from_db(self.db)
+
         # Auto-restore last selected video path on app launch
         last_video = self.db.get_setting("last_video_path", "")
         if last_video and os.path.exists(last_video):
             self.video_player.load_video(last_video)
+
+    def _update_status_bar_badges(self):
+        stt_m = self.db.get_setting("whisper_model", "Whisper Base")
+        trans_m = self.db.get_setting("ai_model", "Gemini 2.5 Flash")
+        keys_count = len(self.db.get_gemini_keys(enabled_only=True))
+        
+        self.lbl_stt_badge.setText(f"🎙️ STT: {stt_m}")
+        if "Gemini" in trans_m:
+            self.lbl_trans_badge.setText(f"🌐 AI: {trans_m} ({keys_count} Keys Active)")
+        else:
+            self.lbl_trans_badge.setText(f"🌐 AI: {trans_m}")
 
     def _start_bgm_isolation(self):
         if not self.current_project.audio_path or not os.path.exists(self.current_project.audio_path):
@@ -472,22 +569,43 @@ class MainWindow(QMainWindow):
 
     def _open_settings(self):
         dlg = SettingsDialog(self.db, self)
-        dlg.exec()
+        if dlg.exec():
+            self._update_status_bar_badges()
 
     def _open_style_dialog(self):
         dlg = SubtitleStyleDialog(self.db, self)
-        dlg.exec()
+        dlg.style_changed.connect(self.video_player.overlay_canvas.set_subtitle_style_config)
+        if dlg.exec():
+            self._apply_style_config()
+
+    def _apply_style_config(self):
+        cfg = self._get_style_config()
+        self.video_player.overlay_canvas.set_subtitle_style_config(cfg)
+
+    def _delete_active_subtitle(self):
+        active_id = self.video_player.overlay_canvas.active_sub_id
+        if active_id is not None:
+            self.subtitles = [s for s in self.subtitles if s.id != active_id]
+            self.subtitle_editor.load_subtitles(self.subtitles)
+            self.timeline_widget.load_subtitles(self.subtitles)
+            self.video_player.set_subtitles(self.subtitles)
+            self.video_player.overlay_canvas.update_playback_position(self.video_player.player.position(), self.subtitles)
 
     def _get_style_config(self) -> dict:
         return {
-            "font_name": self.db.get_setting("sub_font_name", "Segoe UI"),
+            "font_name": self.db.get_setting("sub_font_name", "Khmer OS Battambang"),
             "font_size": int(self.db.get_setting("sub_font_size", "24")),
             "primary_color": self.db.get_setting("sub_primary_color", "#FFFFFF"),
             "outline_color": self.db.get_setting("sub_outline_color", "#000000"),
+            "bg_color": self.db.get_setting("sub_bg_color", "#1E1E2E"),
             "outline_width": int(self.db.get_setting("sub_outline_width", "2")),
+            "shadow_width": int(self.db.get_setting("sub_shadow_width", "1")),
             "bold": self.db.get_setting("sub_bold", "true") == "true",
             "italic": self.db.get_setting("sub_italic", "false") == "true",
-            "alignment": self.db.get_setting("sub_alignment", "Bottom Center")
+            "use_bg_box": self.db.get_setting("sub_use_bg_box", "false") == "true",
+            "alignment": self.db.get_setting("sub_alignment", "Bottom Center"),
+            "sub_x_pct": self.video_player.overlay_canvas.sub_x_pct,
+            "sub_y_pct": self.video_player.overlay_canvas.sub_y_pct
         }
 
     def _on_video_loaded(self, video_path: str):
@@ -555,11 +673,6 @@ class MainWindow(QMainWindow):
         self.timeline_widget.load_subtitles(self.subtitles)
         self.video_player.set_subtitles(self.subtitles)
 
-    def _on_subtitles_changed(self):
-        self.subtitles = self.subtitle_editor.get_subtitles()
-        self.timeline_widget.load_subtitles(self.subtitles)
-        self.video_player.set_subtitles(self.subtitles)
-
     def _start_translation(self):
         if not self.subtitles:
             QMessageBox.warning(self, "Warning", "No subtitles loaded to translate.")
@@ -572,7 +685,8 @@ class MainWindow(QMainWindow):
             api_key=self.db.get_setting("gemini_api_key", ""),
             model_name=self.db.get_setting("ai_model", "gemini-2.5-flash"),
             custom_prompt=self.db.get_setting("system_prompt", ""),
-            cache_mgr=self.cache_mgr
+            cache_mgr=self.cache_mgr,
+            db=self.db
         )
         self.trans_worker.progress.connect(self._update_progress)
         self.trans_worker.line_translated.connect(self.subtitle_editor.update_single_translation)
@@ -587,6 +701,7 @@ class MainWindow(QMainWindow):
         self.subtitle_editor.load_subtitles(self.subtitles)
         self.timeline_widget.load_subtitles(self.subtitles)
         self.video_player.set_subtitles(self.subtitles)
+        self.video_player.overlay_canvas.update_playback_position(self.video_player.player.position(), self.subtitles)
 
     def _start_tts(self):
         if not self.subtitles:
@@ -618,25 +733,17 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(f"Error: {err_msg}")
         QMessageBox.critical(self, "Error", f"Worker failed: {err_msg}")
 
+    def _on_subtitles_changed(self):
+        self.subtitles = self.subtitle_editor.get_subtitles()
+        self.timeline_widget.load_subtitles(self.subtitles)
+        self.video_player.set_subtitles(self.subtitles)
+        self.video_player.overlay_canvas.update_playback_position(self.video_player.player.position(), self.subtitles)
+
     def _on_player_position_changed(self, pos: int):
         dur = self.video_player.player.duration()
         self.timeline_widget.update_playhead(pos, dur)
-
-        # Sync active subtitle overlay text on video frame
-        active_sub_text = ""
-        for sub in self.subtitles:
-            if sub.start_ms <= pos <= sub.end_ms:
-                active_sub_text = sub.tgt_text if sub.tgt_text else sub.src_text
-                break
-        
-        style_cfg = self._get_style_config()
-        self.video_player.overlay_canvas.set_subtitle_style(
-            font_family=style_cfg.get("font_name", "Khmer OS Battambang"),
-            font_size=style_cfg.get("font_size", 24),
-            primary_color=style_cfg.get("primary_color", "#FFFFFF"),
-            outline_color=style_cfg.get("outline_color", "#000000")
-        )
-        self.video_player.overlay_canvas.set_subtitle_text(active_sub_text)
+        self.video_player.overlay_canvas.update_playback_position(pos, self.subtitles)
+        self.video_player.overlay_canvas.raise_()
 
     def _import_srt(self):
         path, _ = QFileDialog.getOpenFileName(self, "Import SRT Subtitles", "", "Subtitles (*.srt)")

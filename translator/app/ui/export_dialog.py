@@ -33,7 +33,8 @@ class ExportWorker(QThread):
                 self.progress.emit(100, "Export Completed Successfully!")
                 self.finished.emit(self.kwargs["output_video_path"])
             else:
-                self.failed.emit("FFmpeg failed to render output video.")
+                err_msg = getattr(self.export_mgr.ffmpeg_mgr, "last_error", "") or "FFmpeg failed to render output video."
+                self.failed.emit(err_msg)
         except Exception as e:
             self.failed.emit(str(e))
 

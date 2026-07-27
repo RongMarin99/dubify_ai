@@ -98,6 +98,36 @@ class DatabaseManager:
             )
             """)
 
+            # Gemini API Keys Table
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS gemini_api_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                api_key_encrypted TEXT NOT NULL,
+                status TEXT DEFAULT 'Working',
+                enabled INTEGER DEFAULT 1,
+                last_used DATETIME,
+                requests_today INTEGER DEFAULT 0,
+                total_requests INTEGER DEFAULT 0,
+                response_time_ms INTEGER DEFAULT 0,
+                sort_order INTEGER DEFAULT 0
+            )
+            """)
+
+            # Migrate legacy gemini_api_key if present and gemini_api_keys table is empty
+            cursor.execute("SELECT COUNT(*) FROM gemini_api_keys")
+            if cursor.fetchone()[0] == 0:
+                cursor.execute("SELECT value FROM settings WHERE key = 'gemini_api_key'")
+                legacy_row = cursor.fetchone()
+                if legacy_row and legacy_row["value"].strip():
+                    from ..utils.crypto import encrypt_api_key
+                    raw_k = legacy_row["value"].strip()
+                    enc_k = encrypt_api_key(raw_k)
+                    cursor.execute("""
+                    INSERT INTO gemini_api_keys (name, api_key_encrypted, status, enabled, sort_order)
+                    VALUES ('Default Key 1', ?, 'Working', 1, 1)
+                    """, (enc_k,))
+
             # Default Voice Profiles
             cursor.execute("SELECT COUNT(*) FROM voices")
             if cursor.fetchone()[0] == 0:
@@ -133,6 +163,97 @@ class DatabaseManager:
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """, (key, value))
             conn.commit()
+
+    # Gemini API Keys CRUD
+    def get_gemini_keys(self, enabled_only: bool = False) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            query = "SELECT * FROM gemini_api_keys"
+            if enabled_only:
+                query += " WHERE enabled = 1"
+            query += " ORDER BY sort_order ASC, id ASC"
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    def add_gemini_key(self, name: str, raw_api_key: str, status: str = "Working", enabled: bool = True) -> int:
+        from ..utils.crypto import encrypt_api_key
+        enc_key = encrypt_api_key(raw_api_key.strip())
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT MAX(sort_order) FROM gemini_api_keys")
+            max_order = cursor.fetchone()[0] or 0
+            cursor.execute("""
+            INSERT INTO gemini_api_keys (name, api_key_encrypted, status, enabled, sort_order)
+            VALUES (?, ?, ?, ?, ?)
+            """, (name.strip(), enc_key, status, 1 if enabled else 0, max_order + 1))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_gemini_key(self, key_id: int, name: Optional[str] = None, raw_api_key: Optional[str] = None,
+                           status: Optional[str] = None, enabled: Optional[bool] = None):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            updates = []
+            params = []
+            if name is not None:
+                updates.append("name = ?")
+                params.append(name.strip())
+            if raw_api_key is not None:
+                from ..utils.crypto import encrypt_api_key
+                updates.append("api_key_encrypted = ?")
+                params.append(encrypt_api_key(raw_api_key.strip()))
+            if status is not None:
+                updates.append("status = ?")
+                params.append(status)
+            if enabled is not None:
+                updates.append("enabled = ?")
+                params.append(1 if enabled else 0)
+
+            if updates:
+                params.append(key_id)
+                cursor.execute(f"UPDATE gemini_api_keys SET {', '.join(updates)} WHERE id = ?", params)
+                conn.commit()
+
+    def update_gemini_key_stats(self, key_id: int, status: str, response_time_ms: int = 0):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            UPDATE gemini_api_keys
+            SET status = ?,
+                response_time_ms = ?,
+                last_used = CURRENT_TIMESTAMP,
+                requests_today = requests_today + 1,
+                total_requests = total_requests + 1
+            WHERE id = ?
+            """, (status, response_time_ms, key_id))
+            conn.commit()
+
+    def delete_gemini_key(self, key_id: int):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM gemini_api_keys WHERE id = ?", (key_id,))
+            conn.commit()
+
+    def move_gemini_key(self, key_id: int, direction: str): # 'up' or 'down'
+        keys = self.get_gemini_keys()
+        for idx, k in enumerate(keys):
+            if k["id"] == key_id:
+                if direction == "up" and idx > 0:
+                    other_idx = idx - 1
+                elif direction == "down" and idx < len(keys) - 1:
+                    other_idx = idx + 1
+                else:
+                    return
+                # Swap sort_orders
+                o_order = keys[other_idx]["sort_order"]
+                c_order = k["sort_order"]
+                with self._get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE gemini_api_keys SET sort_order = ? WHERE id = ?", (o_order, k["id"]))
+                    cursor.execute("UPDATE gemini_api_keys SET sort_order = ? WHERE id = ?", (c_order, keys[other_idx]["id"]))
+                    conn.commit()
+                break
 
     # Cache Operations
     def get_cached_translation(self, src_text: str, source_lang: str = "zh", target_lang: str = "km") -> Optional[str]:

@@ -127,10 +127,44 @@ def clean_khmer_translation(raw_text: str) -> str:
     return text
 
 
+import time
+from typing import List, Optional, Dict, Any
+from ..database.sqlite import DatabaseManager
+from ..utils.crypto import decrypt_api_key
+
+def test_gemini_key(raw_api_key: str, model_name: str = "gemini-2.5-flash") -> tuple[bool, str, int]:
+    """Tests a single Gemini API key and measures response time in ms."""
+    if not raw_api_key:
+        return False, "Invalid", 0
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={raw_api_key}"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": "Ping"}]}],
+        "generationConfig": {"maxOutputTokens": 5}
+    }
+    start_t = time.time()
+    try:
+        res = requests.post(url, headers=headers, json=payload, timeout=10)
+        elapsed_ms = int((time.time() - start_t) * 1000)
+        if res.status_code == 200:
+            return True, "Working", elapsed_ms
+        elif res.status_code in (429, 403):
+            return False, "Quota Exceeded", elapsed_ms
+        else:
+            return False, "Invalid", elapsed_ms
+    except Exception:
+        elapsed_ms = int((time.time() - start_t) * 1000)
+        return False, "Invalid", elapsed_ms
+
+
 class GeminiProvider(BaseAIProvider):
-    def __init__(self, api_key: str = "", model_name: str = "gemini-2.5-flash"):
+    _round_robin_idx = 0
+
+    def __init__(self, api_key: str = "", model_name: str = "gemini-2.5-flash", db: Optional[DatabaseManager] = None):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
         self.model_name = model_name
+        self.db = db
         self.fallback_provider = GoogleTranslateProvider()
 
     def translate(
@@ -146,9 +180,6 @@ class GeminiProvider(BaseAIProvider):
         if not text.strip():
             return ""
 
-        if not self.api_key:
-            return self.fallback_provider.translate(text, source_lang, target_lang)
-
         system_prompt = prompt_template or NETFLIX_MASTER_PROMPT
 
         user_content = f"Source Language: {source_lang}\nTarget Language: {target_lang}\n\n"
@@ -161,8 +192,8 @@ class GeminiProvider(BaseAIProvider):
             user_content += f"Target Dialogue: {text}"
 
         # Phase 1: Context & Relationship Aware Localization Pass
-        raw_translation = self._call_gemini_api(system_prompt, user_content, temperature)
-        if not raw_translation or raw_translation.startswith("Error") or raw_translation.startswith("API Exception"):
+        raw_translation = self._call_gemini_api_with_rotation(system_prompt, user_content, temperature)
+        if not raw_translation or raw_translation.startswith("Error") or raw_translation.startswith("API Exception") or raw_translation == "No available Gemini API key.":
             return self.fallback_provider.translate(text, source_lang, target_lang)
 
         cleaned_khmer = clean_khmer_translation(raw_translation)
@@ -178,7 +209,7 @@ class GeminiProvider(BaseAIProvider):
     def polish_khmer_dialogue(self, draft_khmer: str, context_prev: str = "", context_next: str = "") -> str:
         """Phase 2 VoxCPM2 Khmer Naturalization & Localization Pass."""
         user_content = f"Input Khmer:\n{draft_khmer}\n\nOutput:"
-        res = self._call_gemini_api(VOXCPM2_KHMER_LOCALIZER_PROMPT, user_content, temperature=0.2)
+        res = self._call_gemini_api_with_rotation(VOXCPM2_KHMER_LOCALIZER_PROMPT, user_content, temperature=0.2)
         cleaned = clean_khmer_translation(res)
         return cleaned if cleaned else draft_khmer
 
@@ -193,17 +224,14 @@ class GeminiProvider(BaseAIProvider):
         if not texts:
             return []
 
-        if not self.api_key:
-            return self.fallback_provider.translate_batch(texts, source_lang, target_lang)
-
         system_prompt = prompt_template or NETFLIX_MASTER_PROMPT
         user_content = f"Translate the following list of subtitle lines from {source_lang} to natural spoken {target_lang}:\n\n"
         for idx, t in enumerate(texts, 1):
             user_content += f"{idx}. {t}\n"
         user_content += "\nReturn JSON array of strings corresponding to translated lines."
 
-        res_raw = self._call_gemini_api(system_prompt, user_content, temperature)
-        if not res_raw or res_raw.startswith("Error"):
+        res_raw = self._call_gemini_api_with_rotation(system_prompt, user_content, temperature)
+        if not res_raw or res_raw.startswith("Error") or res_raw == "No available Gemini API key.":
             return self.fallback_provider.translate_batch(texts, source_lang, target_lang)
 
         try:
@@ -216,28 +244,101 @@ class GeminiProvider(BaseAIProvider):
 
         return [self.translate(t, source_lang, target_lang, prompt_template, temperature=temperature) for t in texts]
 
-    def _call_gemini_api(self, system_prompt: str, user_content: str, temperature: float = 0.3) -> str:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={self.api_key}"
-        headers = {"Content-Type": "application/json"}
-        payload = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": f"{system_prompt}\n\nTask:\n{user_content}"}]
+    def _get_key_candidates(self) -> List[Dict[str, Any]]:
+        """Retrieve key candidates according to Load Balancing Mode."""
+        if not self.db:
+            if self.api_key:
+                return [{"id": -1, "name": "Direct Key", "api_key_encrypted": self.api_key, "status": "Working", "response_time_ms": 0}]
+            return []
+
+        keys = self.db.get_gemini_keys(enabled_only=True)
+        if not keys:
+            if self.api_key:
+                return [{"id": -1, "name": "Direct Key", "api_key_encrypted": self.api_key, "status": "Working", "response_time_ms": 0}]
+            return []
+
+        # Filter out known invalid keys, but allow Quota Exceeded if no working keys remain
+        working_keys = [k for k in keys if k.get("status") in ("Working", "Quota Exceeded", "Unknown", None)]
+        if not working_keys:
+            working_keys = keys
+
+        mode = self.db.get_setting("load_balancing_mode", "Sequential")
+
+        if mode == "Round Robin" and len(working_keys) > 1:
+            GeminiProvider._round_robin_idx = (GeminiProvider._round_robin_idx + 1) % len(working_keys)
+            # Reorder list starting from round robin index
+            idx = GeminiProvider._round_robin_idx
+            return working_keys[idx:] + working_keys[:idx]
+
+        elif mode == "Fastest Response":
+            # Sort keys by response_time_ms (putting non-zero lowest latency first)
+            def sort_key(k):
+                ms = k.get("response_time_ms", 0)
+                return ms if ms > 0 else 999999
+            return sorted(working_keys, key=sort_key)
+
+        else:  # Sequential (default)
+            return working_keys
+
+    def _call_gemini_api_with_rotation(self, system_prompt: str, user_content: str, temperature: float = 0.3) -> str:
+        candidates = self._get_key_candidates()
+        if not candidates:
+            return "No available Gemini API key."
+
+        last_error = ""
+        for key_item in candidates:
+            raw_key = decrypt_api_key(key_item["api_key_encrypted"])
+            if not raw_key:
+                continue
+
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={raw_key}"
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": f"{system_prompt}\n\nTask:\n{user_content}"}]
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": temperature,
+                    "maxOutputTokens": 300
                 }
-            ],
-            "generationConfig": {
-                "temperature": temperature,
-                "maxOutputTokens": 300
             }
-        }
-        try:
-            res = requests.post(url, headers=headers, json=payload, timeout=20)
-            if res.status_code == 200:
-                data = res.json()
-                text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                return text
-            else:
-                return f"Error {res.status_code}: {res.text}"
-        except Exception as e:
-            return f"API Exception: {str(e)}"
+
+            start_t = time.time()
+            try:
+                res = requests.post(url, headers=headers, json=payload, timeout=20)
+                elapsed_ms = int((time.time() - start_t) * 1000)
+
+                if res.status_code == 200:
+                    data = res.json()
+                    text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    if self.db and key_item.get("id", -1) != -1:
+                        self.db.update_gemini_key_stats(key_item["id"], status="Working", response_time_ms=elapsed_ms)
+                    return text
+
+                elif res.status_code in (429, 403):
+                    last_error = f"Error {res.status_code}: Quota/Rate Limit"
+                    if self.db and key_item.get("id", -1) != -1:
+                        self.db.update_gemini_key_stats(key_item["id"], status="Quota Exceeded", response_time_ms=elapsed_ms)
+                    # Silently continue to next candidate key!
+                    continue
+
+                else:
+                    last_error = f"Error {res.status_code}: {res.text}"
+                    if self.db and key_item.get("id", -1) != -1:
+                        self.db.update_gemini_key_stats(key_item["id"], status="Invalid", response_time_ms=elapsed_ms)
+                    continue
+
+            except Exception as e:
+                elapsed_ms = int((time.time() - start_t) * 1000)
+                last_error = f"API Exception: {str(e)}"
+                if self.db and key_item.get("id", -1) != -1:
+                    self.db.update_gemini_key_stats(key_item["id"], status="Invalid", response_time_ms=elapsed_ms)
+                continue
+
+        if last_error:
+            return f"No available Gemini API key. ({last_error})"
+        return "No available Gemini API key."
+

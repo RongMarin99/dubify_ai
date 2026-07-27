@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Any
 from PySide6.QtCore import QThread, Signal
 from ..model.models import SubtitleItem
 from ..ai.base import BaseAIProvider
@@ -22,7 +22,8 @@ class TranslationWorker(QThread):
         model_name: str = "gemini-2.5-flash",
         custom_prompt: str = "",
         use_cache: bool = True,
-        cache_mgr: Optional[CacheManager] = None
+        cache_mgr: Optional[CacheManager] = None,
+        db: Optional[Any] = None
     ):
         super().__init__()
         self.subtitles = subtitles
@@ -32,6 +33,7 @@ class TranslationWorker(QThread):
         self.custom_prompt = custom_prompt
         self.use_cache = use_cache
         self.cache_mgr = cache_mgr
+        self.db = db
 
     def run(self):
         try:
@@ -41,6 +43,7 @@ class TranslationWorker(QThread):
                 return
 
             provider = self._create_provider()
+            smart_ai = self.db.get_setting("smart_ai_selection", "true") == "true" if self.db else True
 
             translated_subs = []
             for idx, item in enumerate(self.subtitles):
@@ -73,6 +76,19 @@ class TranslationWorker(QThread):
                         context_next=next_context
                     )
 
+                    # Smart AI Fallback check if Gemini key rotation failed
+                    if smart_ai and (not khmer_translation or "No available Gemini API key" in khmer_translation):
+                        # Switch automatically to local AI (Ollama / Local LLM)
+                        fallback = OllamaProvider(model_name="qwen2.5:7b")
+                        khmer_translation = fallback.translate(
+                            text=item.src_text,
+                            source_lang="Chinese",
+                            target_lang="Khmer",
+                            prompt_template=self.custom_prompt,
+                            context_prev=prev_context,
+                            context_next=next_context
+                        )
+
                     item.tgt_text = khmer_translation
                     item.status = "Translated"
 
@@ -93,11 +109,16 @@ class TranslationWorker(QThread):
             self.failed.emit(str(e))
 
     def _create_provider(self) -> BaseAIProvider:
-        if self.engine_name == "Gemini":
-            return GeminiProvider(api_key=self.api_key, model_name=self.model_name)
-        elif self.engine_name in ["OpenAI", "DeepSeek"]:
+        if self.engine_name in ["Gemini", "Gemini 2.5 Flash", "Gemini 2.5 Pro"]:
+            m_name = self.model_name
+            if self.engine_name == "Gemini 2.5 Pro":
+                m_name = "gemini-2.5-pro"
+            elif self.engine_name == "Gemini 2.5 Flash":
+                m_name = "gemini-2.5-flash"
+            return GeminiProvider(api_key=self.api_key, model_name=m_name, db=self.db)
+        elif self.engine_name in ["OpenAI", "OpenAI GPT", "DeepSeek"]:
             return OpenAIProvider(api_key=self.api_key, model_name=self.model_name)
-        elif self.engine_name == "Ollama":
+        elif self.engine_name in ["Ollama", "Qwen", "Local LLM"]:
             return OllamaProvider(model_name=self.model_name)
         else:
             return GoogleTranslateProvider()
