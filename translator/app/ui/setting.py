@@ -40,6 +40,26 @@ class LocalModelDetectorThread(QThread):
         self.detected.emit(models)
 
 
+class WhisperModelDownloadThread(QThread):
+    """Actually loads the faster-whisper model once, which forces huggingface_hub to
+    download + cache the weights if they aren't already local. No fake progress theater —
+    this really downloads (or confirms) the model."""
+    finished_ok = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, model_size: str):
+        super().__init__()
+        self.model_size = model_size
+
+    def run(self):
+        try:
+            from faster_whisper import WhisperModel
+            WhisperModel(self.model_size, device="cpu", compute_type="int8")
+            self.finished_ok.emit(self.model_size)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 class SettingsNavItemWidget(QFrame):
     clicked = Signal(int)
 
@@ -406,76 +426,86 @@ class SettingsDialog(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
-        # Card 1: Engine Selection
-        grp_engine = QGroupBox("Transcription Engine (STT)")
-        fl = QVBoxLayout(grp_engine)
-        fl.setSpacing(10)
+        # Card 1: Engine — the ONE place transcription is configured. The Timeline's
+        # "Generate Transcript" button just uses whatever is set here, no picker there.
+        grp_source = QGroupBox("Transcription Engine (STT)")
+        src_l = QVBoxLayout(grp_source)
+        src_l.setSpacing(8)
+
+        row_src = QHBoxLayout()
+        row_src.addWidget(QLabel("Engine:"))
+        self.combo_stt_source = QComboBox()
+        self.combo_stt_source.addItems([
+            "Gemini (Cloud — Recommended)",
+            "Whisper (Local — Offline)"
+        ])
+        self.combo_stt_source.currentTextChanged.connect(self._on_stt_source_changed)
+        row_src.addWidget(self.combo_stt_source, 1)
+        src_l.addLayout(row_src)
+
+        layout.addWidget(grp_source)
+
+        # Card 1a: Gemini model — reuses the same API keys + auto-rotation configured
+        # in the Translation tab (one key hits quota, it auto-switches to the next).
+        self.grp_gemini_stt = QGroupBox("Gemini Model")
+        gem_l = QVBoxLayout(self.grp_gemini_stt)
+        gem_l.setSpacing(8)
+        row_gem = QHBoxLayout()
+        row_gem.addWidget(QLabel("Model:"))
+        self.combo_gemini_stt_model = QComboBox()
+        self.combo_gemini_stt_model.addItems([
+            "Gemini 2.5 Flash — Recommended (Fast & Accurate)",
+            "Gemini 2.5 Pro — Best Accuracy, Slower"
+        ])
+        row_gem.addWidget(self.combo_gemini_stt_model, 1)
+        gem_l.addLayout(row_gem)
+        gem_note = QLabel(
+            "Cloud transcription — needs at least one Gemini API key (Translation tab). "
+            "Handles accents and noisy audio well; uses your existing multi-key rotation, "
+            "so one key hitting its quota automatically falls through to the next."
+        )
+        gem_note.setWordWrap(True)
+        gem_note.setStyleSheet("color: #8c89b4; font-size: 11px;")
+        gem_l.addWidget(gem_note)
+        layout.addWidget(self.grp_gemini_stt)
+
+        # Card 1b: Local Whisper size — offline, no API key needed. Large v3 is the
+        # default: best accuracy, and slow is fine since it still runs unattended.
+        self.grp_whisper_stt = QGroupBox("Local Whisper Model")
+        fl = QVBoxLayout(self.grp_whisper_stt)
+        fl.setSpacing(8)
 
         row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Select Engine / Model:"))
+        row1.addWidget(QLabel("Model Size:"))
         self.combo_stt_engine = QComboBox()
         self.combo_stt_engine.addItems([
-            "Gemini 2.5 Flash",
-            "Gemini 2.5 Pro",
-            "Whisper Tiny",
-            "Whisper Base",
-            "Whisper Small",
-            "Whisper Medium",
-            "Whisper Large v3",
-            "Faster Whisper",
-            "Local Whisper",
-            "VoxCPM2 (optional)"
+            "Whisper Tiny — Fastest, Draft Only",
+            "Whisper Base — Fast",
+            "Whisper Small — Balanced",
+            "Whisper Medium — Balanced+",
+            "Whisper Large v3 — Best Accuracy, Slowest (Recommended)"
         ])
-        self.combo_stt_engine.currentTextChanged.connect(self._update_stt_info_card)
+        self.combo_stt_engine.setCurrentText("Whisper Large v3 — Best Accuracy, Slowest (Recommended)")
         row1.addWidget(self.combo_stt_engine, 1)
 
-        self.btn_download_stt_model = QPushButton("📥 Download Local Model")
+        self.btn_download_stt_model = QPushButton("📥 Download / Verify Model")
         self.btn_download_stt_model.setObjectName("btnPrimary")
-        self.btn_download_stt_model.setToolTip("Download offline Whisper model weights for fast local transcription")
+        self.btn_download_stt_model.setToolTip("Downloads the model weights now (if not already cached) instead of waiting on the first transcription run.")
         self.btn_download_stt_model.clicked.connect(self._on_download_local_stt_model)
         row1.addWidget(self.btn_download_stt_model)
 
         fl.addLayout(row1)
 
-        layout.addWidget(grp_engine)
+        note = QLabel(
+            "Runs locally on CPU, fully offline — no API key, no internet needed after the "
+            "first download. Weights auto-download and cache the first time a size is used. "
+            "Large v3 is slower but most accurate; fine to leave running in the background."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #8c89b4; font-size: 11px;")
+        fl.addWidget(note)
 
-        # Card 2: STT Spec Display Card
-        grp_card = QGroupBox("Engine Hardware & Performance Profile")
-        card_l = QHBoxLayout(grp_card)
-
-        # Current Model
-        v1 = QVBoxLayout()
-        v1.addWidget(QLabel("Current Model"))
-        self.lbl_stt_model = QLabel("Whisper Base")
-        self.lbl_stt_model.setStyleSheet("font-size: 14px; font-weight: 700; color: #3b82f6;")
-        v1.addWidget(self.lbl_stt_model)
-        card_l.addLayout(v1)
-
-        # GPU / CPU Status
-        v2 = QVBoxLayout()
-        v2.addWidget(QLabel("Execution Device"))
-        self.lbl_stt_device = QLabel("🟢 CUDA GPU")
-        self.lbl_stt_device.setStyleSheet("font-size: 14px; font-weight: 700; color: #10b981;")
-        v2.addWidget(self.lbl_stt_device)
-        card_l.addLayout(v2)
-
-        # Speed
-        v3 = QVBoxLayout()
-        v3.addWidget(QLabel("Estimated Speed"))
-        self.lbl_stt_speed = QLabel("🚀 12x Realtime")
-        self.lbl_stt_speed.setStyleSheet("font-size: 14px; font-weight: 700; color: #f59e0b;")
-        v3.addWidget(self.lbl_stt_speed)
-        card_l.addLayout(v3)
-
-        # Accuracy
-        v4 = QVBoxLayout()
-        v4.addWidget(QLabel("Estimated Accuracy"))
-        self.lbl_stt_accuracy = QLabel("🎯 96.0% (High)")
-        self.lbl_stt_accuracy.setStyleSheet("font-size: 14px; font-weight: 700; color: #ec4899;")
-        v4.addWidget(self.lbl_stt_accuracy)
-        card_l.addLayout(v4)
-
-        layout.addWidget(grp_card)
+        layout.addWidget(self.grp_whisper_stt)
 
         # Card 3: Language Configuration
         grp_lang = QGroupBox("Target Source Language Detection")
@@ -494,71 +524,63 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(grp_lang)
 
-        # Options
-        grp_opts = QGroupBox("Audio Pre-processing")
-        opt_l = QVBoxLayout(grp_opts)
+        # Options — VAD is a local-Whisper concept only, hidden for Gemini
+        self.grp_stt_opts = QGroupBox("Audio Pre-processing")
+        opt_l = QVBoxLayout(self.grp_stt_opts)
         self.chk_vad = QCheckBox("Enable Silero VAD (Voice Activity Detection) Silence Filter")
         opt_l.addWidget(self.chk_vad)
-        layout.addWidget(grp_opts)
+        layout.addWidget(self.grp_stt_opts)
 
         layout.addStretch()
+
+        self._on_stt_source_changed(self.combo_stt_source.currentText())
         return page
+
+    def _on_stt_source_changed(self, val: str):
+        is_gemini = val.startswith("Gemini")
+        self.grp_gemini_stt.setVisible(is_gemini)
+        self.grp_whisper_stt.setVisible(not is_gemini)
+        self.grp_stt_opts.setVisible(not is_gemini)
+
+    @staticmethod
+    def _stt_size_keyword(label: str) -> str:
+        """Map a combo label ("Whisper Medium — Recommended") to the faster-whisper
+        size keyword it actually needs ("medium")."""
+        m_str = label.lower()
+        if "large" in m_str:
+            return "large-v3"
+        elif "medium" in m_str:
+            return "medium"
+        elif "small" in m_str:
+            return "small"
+        elif "tiny" in m_str:
+            return "tiny"
+        return "base"
 
     def _on_download_local_stt_model(self):
         selected_model = self.combo_stt_engine.currentText()
-        if "Gemini" in selected_model:
-            QMessageBox.information(self, "Cloud Model", f"'{selected_model}' is a Cloud AI model. No local download required.")
-            return
+        size = self._stt_size_keyword(selected_model)
 
-        from PySide6.QtWidgets import QProgressDialog
-        progress_dlg = QProgressDialog(f"Downloading & Caching Local STT Model ({selected_model})...", "Cancel", 0, 100, self)
-        progress_dlg.setWindowTitle("Downloading Local AI Model")
-        progress_dlg.setWindowModality(Qt.WindowModal)
-        progress_dlg.setValue(30)
-        progress_dlg.show()
-        QApplication.processEvents()
+        self.btn_download_stt_model.setEnabled(False)
+        self.btn_download_stt_model.setText("⏳ Downloading...")
 
-        # Download simulation
-        progress_dlg.setValue(70)
-        QApplication.processEvents()
-        progress_dlg.setValue(100)
+        self._dl_thread = WhisperModelDownloadThread(size)
+        self._dl_thread.finished_ok.connect(self._on_stt_download_ok)
+        self._dl_thread.failed.connect(self._on_stt_download_failed)
+        self._dl_thread.start()
 
-        QMessageBox.information(
-            self,
-            "Download Complete",
-            f"✅ Local STT Model '{selected_model}' downloaded & installed successfully!\n"
-            f"Model weights saved for offline transcription."
-        )
+    def _on_stt_download_ok(self, size: str):
+        self.btn_download_stt_model.setEnabled(True)
+        self.btn_download_stt_model.setText("📥 Download / Verify Model")
+        QMessageBox.information(self, "Model Ready", f"✅ Whisper '{size}' is downloaded and cached — ready for offline transcription.")
+
+    def _on_stt_download_failed(self, error: str):
+        self.btn_download_stt_model.setEnabled(True)
+        self.btn_download_stt_model.setText("📥 Download / Verify Model")
+        QMessageBox.warning(self, "Download Failed", f"Could not download the model:\n{error}")
 
     def _on_stt_lang_changed(self, val: str):
         self.edit_custom_lang.setVisible(val == "Custom")
-
-    def _update_stt_info_card(self, model_name: str):
-        self.lbl_stt_model.setText(model_name)
-        if "Gemini" in model_name:
-            self.lbl_stt_device.setText("☁️ Cloud API")
-            self.lbl_stt_speed.setText("⚡ Instant Cloud")
-            self.lbl_stt_accuracy.setText("🎯 99.2% Extreme")
-            self.btn_download_stt_model.setText("☁️ Cloud Model (Ready)")
-            self.btn_download_stt_model.setEnabled(False)
-        elif "Large" in model_name:
-            self.lbl_stt_device.setText("🟢 CUDA GPU")
-            self.lbl_stt_speed.setText("🚀 6x Realtime")
-            self.lbl_stt_accuracy.setText("🎯 98.8% High")
-            self.btn_download_stt_model.setText("📥 Download Local Model")
-            self.btn_download_stt_model.setEnabled(True)
-        elif "Tiny" in model_name or "Base" in model_name:
-            self.lbl_stt_device.setText("💻 CPU / GPU")
-            self.lbl_stt_speed.setText("⚡ 20x Realtime")
-            self.lbl_stt_accuracy.setText("🎯 92.5% Fast")
-            self.btn_download_stt_model.setText("📥 Download Local Model")
-            self.btn_download_stt_model.setEnabled(True)
-        else:
-            self.lbl_stt_device.setText("🟢 CUDA GPU")
-            self.lbl_stt_speed.setText("🚀 12x Realtime")
-            self.lbl_stt_accuracy.setText("🎯 96.5% High")
-            self.btn_download_stt_model.setText("📥 Download Local Model")
-            self.btn_download_stt_model.setEnabled(True)
 
     # ----------------------------------------------------
     # SECTION 2: Translation
@@ -1014,7 +1036,18 @@ class SettingsDialog(QDialog):
     # ----------------------------------------------------
     def _load_all_settings(self):
         # STT
-        stt_model = self.db.get_setting("whisper_model", "Whisper Base")
+        stt_source = self.db.get_setting("stt_engine", "Gemini (Cloud — Recommended)")
+        idx = self.combo_stt_source.findText(stt_source)
+        if idx != -1:
+            self.combo_stt_source.setCurrentIndex(idx)
+        self._on_stt_source_changed(self.combo_stt_source.currentText())
+
+        gemini_model = self.db.get_setting("gemini_stt_model_label", "Gemini 2.5 Flash — Recommended (Fast & Accurate)")
+        idx = self.combo_gemini_stt_model.findText(gemini_model)
+        if idx != -1:
+            self.combo_gemini_stt_model.setCurrentIndex(idx)
+
+        stt_model = self.db.get_setting("whisper_model", "Whisper Large v3 — Best Accuracy, Slowest (Recommended)")
         idx = self.combo_stt_engine.findText(stt_model)
         if idx != -1:
             self.combo_stt_engine.setCurrentIndex(idx)
@@ -1063,6 +1096,10 @@ class SettingsDialog(QDialog):
 
     def _on_save_all(self):
         # STT
+        self.db.set_setting("stt_engine", self.combo_stt_source.currentText())
+        gemini_stt_label = self.combo_gemini_stt_model.currentText()
+        self.db.set_setting("gemini_stt_model_label", gemini_stt_label)
+        self.db.set_setting("gemini_stt_model", "gemini-2.5-pro" if "Pro" in gemini_stt_label else "gemini-2.5-flash")
         self.db.set_setting("whisper_model", self.combo_stt_engine.currentText())
         self.db.set_setting("stt_language", self.combo_stt_lang.currentText())
         self.db.set_setting("custom_stt_language", self.edit_custom_lang.text().strip())

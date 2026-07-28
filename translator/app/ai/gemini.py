@@ -1,13 +1,45 @@
 import os
 import json
 import re
+import time
+import mimetypes
 import requests
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from .base import BaseAIProvider
 from .deepl import GoogleTranslateProvider
 
-NETFLIX_MASTER_PROMPT = """You are an expert AI localization system for Chinese TV dramas (ប្រព័ន្ធបកប្រែ និងសម្រួលរឿងភាគចិនកម្រិត Netflix/iQIYI).
-Your mission is to produce professional Chinese-to-Khmer subtitles and audio dubbing scripts comparable to official Cambodian TV dubbing quality.
+GEMINI_TRANSCRIBE_PROMPT = """You are a professional subtitle transcription engine for movies and TV dramas.
+Transcribe ALL spoken dialogue in this audio verbatim, in the language actually spoken (do not translate it).
+Segment the transcript into natural subtitle lines the way closed captions are segmented — split on speech
+pauses, each line one complete thought, preserve names and emotional expressions exactly as spoken.
+
+Output STRICTLY in this format, one subtitle per line, nothing else (no headers, no explanations, no markdown):
+[HH:MM:SS.mmm --> HH:MM:SS.mmm] transcribed text
+"""
+
+
+def parse_gemini_transcript(raw_text: str) -> List[Dict[str, Any]]:
+    """Parse Gemini's `[HH:MM:SS.mmm --> HH:MM:SS.mmm] text` transcript lines into segments."""
+    pattern = re.compile(
+        r'\[(\d{2}):(\d{2}):(\d{2})[.,](\d{1,3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[.,](\d{1,3})\]\s*(.+)'
+    )
+    segments = []
+    for line in (raw_text or "").splitlines():
+        m = pattern.match(line.strip())
+        if not m:
+            continue
+        h1, m1, s1, ms1, h2, m2, s2, ms2, text = m.groups()
+        text = text.strip()
+        if not text:
+            continue
+        start_ms = (int(h1) * 3600 + int(m1) * 60 + int(s1)) * 1000 + int(ms1.ljust(3, "0")[:3])
+        end_ms = (int(h2) * 3600 + int(m2) * 60 + int(s2)) * 1000 + int(ms2.ljust(3, "0")[:3])
+        if end_ms > start_ms:
+            segments.append({"start_ms": start_ms, "end_ms": end_ms, "text": text})
+    return segments
+
+NETFLIX_MASTER_PROMPT = """You are an expert AI localization system for TV dramas and movies, Chinese or English source (ប្រព័ន្ធបកប្រែ និងសម្រួលរឿងភាគចិន/ភាសាអង់គ្លេសកម្រិត Netflix/iQIYI).
+Your mission is to produce professional source-to-Khmer subtitles and audio dubbing scripts comparable to official Cambodian TV dubbing quality. The exact source language is given per request — translate naturally from whichever language is specified, not only Chinese.
 
 Your workflow must always be:
 1. Analyze surrounding context (5-7 dialogue lines).
@@ -127,8 +159,6 @@ def clean_khmer_translation(raw_text: str) -> str:
     return text
 
 
-import time
-from typing import List, Optional, Dict, Any
 from ..database.sqlite import DatabaseManager
 from ..utils.crypto import decrypt_api_key
 
@@ -243,6 +273,137 @@ class GeminiProvider(BaseAIProvider):
             pass
 
         return [self.translate(t, source_lang, target_lang, prompt_template, temperature=temperature) for t in texts]
+
+    def transcribe_audio(self, audio_path: str, language: Optional[str] = None, progress_cb=None) -> List[Dict[str, Any]]:
+        """Transcribe an audio file using Gemini's multimodal audio understanding.
+        Uploads via the File API (works for full-length movie audio, not just short
+        clips), then asks for a timestamped transcript and parses it into segments.
+        Uses the same multi-key rotation as translation — one key hitting quota
+        automatically falls through to the next."""
+        candidates = self._get_key_candidates()
+        if not candidates:
+            raise RuntimeError("No available Gemini API key.")
+
+        last_error = ""
+        for key_item in candidates:
+            raw_key = decrypt_api_key(key_item["api_key_encrypted"])
+            if not raw_key:
+                continue
+            try:
+                if progress_cb:
+                    progress_cb(15, "Uploading audio to Gemini...")
+                file_uri, mime_type = self._upload_audio_file(audio_path, raw_key)
+
+                if progress_cb:
+                    progress_cb(35, "Gemini is processing the audio...")
+                self._wait_file_active(file_uri, raw_key)
+
+                if progress_cb:
+                    progress_cb(50, "Transcribing with Gemini...")
+                prompt = GEMINI_TRANSCRIBE_PROMPT
+                if language:
+                    prompt += f"\nThe spoken language is: {language}."
+
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={raw_key}"
+                payload = {
+                    "contents": [{
+                        "role": "user",
+                        "parts": [
+                            {"file_data": {"file_uri": file_uri, "mime_type": mime_type}},
+                            {"text": prompt}
+                        ]
+                    }],
+                    "generationConfig": {"temperature": 0.1, "maxOutputTokens": 65536}
+                }
+                res = requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=600)
+
+                if res.status_code == 200:
+                    data = res.json()
+                    text = data["candidates"][0]["content"]["parts"][0]["text"]
+                    if self.db and key_item.get("id", -1) != -1:
+                        self.db.update_gemini_key_stats(key_item["id"], status="Working")
+                    segments = parse_gemini_transcript(text)
+                    if not segments:
+                        raise RuntimeError("Gemini returned no parseable subtitle lines.")
+                    return segments
+
+                elif res.status_code in (429, 403):
+                    last_error = f"Error {res.status_code}: Quota/Rate Limit"
+                    if self.db and key_item.get("id", -1) != -1:
+                        self.db.update_gemini_key_stats(key_item["id"], status="Quota Exceeded")
+                    continue
+                else:
+                    last_error = f"Error {res.status_code}: {res.text[:200]}"
+                    continue
+
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+        raise RuntimeError(last_error or "Gemini transcription failed on all available keys.")
+
+    @staticmethod
+    def _upload_audio_file(audio_path: str, api_key: str):
+        """Resumable upload to the Gemini File API. Returns (file_uri, mime_type)."""
+        mime_type = mimetypes.guess_type(audio_path)[0] or "audio/wav"
+        file_size = os.path.getsize(audio_path)
+        display_name = os.path.basename(audio_path)
+
+        start_res = requests.post(
+            f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={api_key}",
+            headers={
+                "X-Goog-Upload-Protocol": "resumable",
+                "X-Goog-Upload-Command": "start",
+                "X-Goog-Upload-Header-Content-Length": str(file_size),
+                "X-Goog-Upload-Header-Content-Type": mime_type,
+                "Content-Type": "application/json"
+            },
+            json={"file": {"display_name": display_name}},
+            timeout=30
+        )
+        start_res.raise_for_status()
+        upload_url = start_res.headers.get("X-Goog-Upload-URL")
+        if not upload_url:
+            raise RuntimeError("Gemini File API did not return an upload URL.")
+
+        with open(audio_path, "rb") as f:
+            audio_bytes = f.read()
+
+        upload_res = requests.post(
+            upload_url,
+            headers={
+                "X-Goog-Upload-Command": "upload, finalize",
+                "X-Goog-Upload-Offset": "0",
+                "Content-Length": str(file_size)
+            },
+            data=audio_bytes,
+            timeout=300
+        )
+        upload_res.raise_for_status()
+        file_info = upload_res.json().get("file", {})
+        file_uri = file_info.get("uri")
+        if not file_uri:
+            raise RuntimeError("Gemini File API upload did not return a file URI.")
+        return file_uri, mime_type
+
+    @staticmethod
+    def _wait_file_active(file_uri: str, api_key: str, timeout_s: int = 120):
+        """Poll until the uploaded file finishes server-side processing."""
+        file_name = file_uri.split("/files/")[-1]
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            res = requests.get(
+                f"https://generativelanguage.googleapis.com/v1beta/files/{file_name}?key={api_key}",
+                timeout=15
+            )
+            if res.status_code == 200:
+                state = res.json().get("state", "")
+                if state == "ACTIVE":
+                    return
+                if state == "FAILED":
+                    raise RuntimeError("Gemini failed to process the uploaded audio file.")
+            time.sleep(2)
+        raise RuntimeError("Timed out waiting for Gemini to process the uploaded audio file.")
 
     def _get_key_candidates(self) -> List[Dict[str, Any]]:
         """Retrieve key candidates according to Load Balancing Mode."""

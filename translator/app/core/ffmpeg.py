@@ -266,21 +266,28 @@ class FFmpegManager:
         filter_complex_parts = []
         cur_v_label = "[0:v]"
 
-        # 1. Blur filter (Gaussian / BoxBlur for Drama & Chinese Hardcoded Subtitles)
+        # 1. Blur filter — frosted glass panel (Gaussian/BoxBlur backdrop + tint + rim highlight)
         if blur_config and blur_config.get("enabled", False):
             bx = blur_config.get("x", 0.10)
             by = blur_config.get("y", 0.80)
             bw = blur_config.get("w", 0.80)
             bh = blur_config.get("h", 0.12)
-            blur_radius = blur_config.get("radius", 22)
+            blur_radius = max(1, int(blur_config.get("radius", 22)))
+            tint_hex = str(blur_config.get("color", "#0f0f19")).lstrip("#")
+            tint_opacity = max(0.0, min(1.0, float(blur_config.get("opacity", 0.85))))
+            tint_ffmpeg = f"0x{tint_hex}@{tint_opacity:.2f}"
             vw, vh = self.get_video_dimensions(video_path)
             x_px = max(0, int(vw * bx))
             y_px = max(0, int(vh * by))
             w_px = max(1, min(vw - x_px, int(vw * bw)))
             h_px = max(1, min(vh - y_px, int(vh * bh)))
-            # Crop subtitle area, apply Gaussian Box Blur radius, and overlay onto video
+            # Crop region -> Gaussian/box blur backdrop -> translucent tint -> thin glass rim
+            # highlight along the top edge (matches the live editor preview) -> overlay back
             filter_complex_parts.append(
-                f"{cur_v_label}crop={w_px}:{h_px}:{x_px}:{y_px},boxblur=luma_radius={blur_radius}:luma_power=2:chroma_radius={blur_radius}:chroma_power=2[b_crop];"
+                f"{cur_v_label}crop={w_px}:{h_px}:{x_px}:{y_px},"
+                f"boxblur=luma_radius={blur_radius}:luma_power=2:chroma_radius={blur_radius}:chroma_power=2,"
+                f"drawbox=x=0:y=0:w=iw:h=ih:color={tint_ffmpeg}:t=fill,"
+                f"drawbox=x=0:y=0:w=iw:h=2:color=white@0.25:t=fill[b_crop];"
                 f"{cur_v_label}[b_crop]overlay={x_px}:{y_px}[v_blur]"
             )
             cur_v_label = "[v_blur]"

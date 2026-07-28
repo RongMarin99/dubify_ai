@@ -23,7 +23,8 @@ class TranslationWorker(QThread):
         custom_prompt: str = "",
         use_cache: bool = True,
         cache_mgr: Optional[CacheManager] = None,
-        db: Optional[Any] = None
+        db: Optional[Any] = None,
+        source_lang: str = "Chinese"
     ):
         super().__init__()
         self.subtitles = subtitles
@@ -34,6 +35,7 @@ class TranslationWorker(QThread):
         self.use_cache = use_cache
         self.cache_mgr = cache_mgr
         self.db = db
+        self.source_lang = source_lang
 
     def run(self):
         try:
@@ -69,7 +71,7 @@ class TranslationWorker(QThread):
 
                     khmer_translation = provider.translate(
                         text=item.src_text,
-                        source_lang="Chinese",
+                        source_lang=self.source_lang,
                         target_lang="Khmer",
                         prompt_template=self.custom_prompt,
                         context_prev=prev_context,
@@ -82,7 +84,7 @@ class TranslationWorker(QThread):
                         fallback = OllamaProvider(model_name="qwen2.5:7b")
                         khmer_translation = fallback.translate(
                             text=item.src_text,
-                            source_lang="Chinese",
+                            source_lang=self.source_lang,
                             target_lang="Khmer",
                             prompt_template=self.custom_prompt,
                             context_prev=prev_context,

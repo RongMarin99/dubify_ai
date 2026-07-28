@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QColorDialog
 )
 from PySide6.QtCore import Qt, QUrl, QTimer, QSize, Signal, QRectF
-from PySide6.QtGui import QIcon, QFont, QDragEnterEvent, QDropEvent, QPainter, QColor
+from PySide6.QtGui import QIcon, QFont, QDragEnterEvent, QDropEvent, QPainter, QColor, QImage
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget, QGraphicsVideoItem
 
@@ -21,6 +21,7 @@ from ..database.sqlite import DatabaseManager
 from ..core.cache import CacheManager
 from ..core.ffmpeg import FFmpegManager, AudioExtractWorker
 from ..core.whisper import WhisperWorker
+from ..core.gemini_stt import GeminiSTTWorker
 from ..core.translator import TranslationWorker
 from ..core.tts import TTSWorker
 from ..core.exporter import ExportManager
@@ -82,6 +83,7 @@ class VideoPlayerWidget(QFrame):
         self.overlay_canvas = VideoOverlayCanvas()
         self.overlay_proxy = self.video_scene.addWidget(self.overlay_canvas)
         self.overlay_proxy.setZValue(9999)
+        self.overlay_canvas.set_frame_provider(self.grab_scene_region)
 
         layout.addWidget(self.video_container, stretch=1)
 
@@ -115,9 +117,10 @@ class VideoPlayerWidget(QFrame):
         self.slider_vol.setFixedWidth(80)
 
         self.btn_logo = QPushButton("🖼️ Logo")
-        self.btn_add_blur = QPushButton("➕ Add Blur")
+        self.btn_add_blur = QPushButton("🌫️ Add Blur")
         self.btn_add_blur.setCheckable(True)
         self.btn_add_blur.setObjectName("PrimaryBtn")
+        self.btn_add_blur.setToolTip("One click adds a ready-to-use frosted blur band over the bottom safe area — drag only if you need to move/resize it.")
         self.overlay_canvas.blur_changed.connect(self._on_blur_changed)
         self.overlay_canvas.blur_color_requested.connect(self._on_pick_blur_color)
         self.btn_add_sub = QPushButton("➕ Add Subtitle")
@@ -141,13 +144,21 @@ class VideoPlayerWidget(QFrame):
         self.lbl_current_time = QLabel("00:00.00")
         self.lbl_duration = QLabel("00:00.00")
 
+        def _divider():
+            line = QFrame()
+            line.setFrameShape(QFrame.VLine)
+            line.setStyleSheet("color: #2a2840;")
+            return line
+
         ctrl_layout.addWidget(self.btn_play)
         ctrl_layout.addWidget(self.btn_stop)
         ctrl_layout.addWidget(self.btn_loop)
         ctrl_layout.addWidget(self.slider_vol)
+        ctrl_layout.addWidget(_divider())
         ctrl_layout.addWidget(self.btn_logo)
         ctrl_layout.addWidget(self.btn_add_blur)
         ctrl_layout.addWidget(self.btn_add_sub)
+        ctrl_layout.addWidget(_divider())
         ctrl_layout.addWidget(self.btn_duck_bg)
         ctrl_layout.addWidget(self.combo_ratio)
         ctrl_layout.addWidget(self.combo_orig_vol)
@@ -173,6 +184,23 @@ class VideoPlayerWidget(QFrame):
 
     def set_subtitles(self, subtitles: List[SubtitleItem]):
         self.subtitles_ref = subtitles
+
+    def grab_scene_region(self, rect: QRectF) -> Optional[QImage]:
+        """Render the current video frame under `rect` (overlay-canvas-local coords,
+        which map 1:1 onto scene coords) into a QImage — lets the blur box preview
+        show a real live blur of the underlying video instead of a flat tint."""
+        w, h = int(rect.width()), int(rect.height())
+        if w <= 0 or h <= 0:
+            return None
+        was_visible = self.overlay_proxy.isVisible()
+        self.overlay_proxy.setVisible(False)
+        image = QImage(w, h, QImage.Format_ARGB32)
+        image.fill(Qt.transparent)
+        painter = QPainter(image)
+        self.video_scene.render(painter, QRectF(0, 0, w, h), rect)
+        painter.end()
+        self.overlay_proxy.setVisible(was_visible)
+        return image
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -216,8 +244,10 @@ class VideoPlayerWidget(QFrame):
     def _on_blur_changed(self, x, y, w, h, enabled):
         self.btn_add_blur.setChecked(enabled)
         if enabled:
+            self.btn_add_blur.setText("✓ Blur On")
             self.btn_add_blur.setStyleSheet("background-color: #6c5ce7; color: #ffffff; font-weight: bold; border-radius: 4px; padding: 5px 12px; border: 1px solid #a29bfe;")
         else:
+            self.btn_add_blur.setText("🌫️ Add Blur")
             self.btn_add_blur.setStyleSheet("")
 
     def _on_add_blur(self):
@@ -293,7 +323,6 @@ class VideoPlayerWidget(QFrame):
         if hasattr(parent_mw, 'db'):
             folder_dir = os.path.dirname(video_path)
             parent_mw.db.set_setting("last_video_dir", folder_dir)
-            parent_mw.db.set_setting("last_video_path", video_path)
 
         self.overlay_canvas.set_video_loaded(True)
         self.overlay_canvas.raise_()
@@ -388,6 +417,7 @@ class MainWindow(QMainWindow):
 
         self.current_project = ProjectModel()
         self.subtitles: List[SubtitleItem] = []
+        self._source_lang_code: str = "zh"  # updated by _on_stt_language_detected after each transcription
 
         self._init_ui()
 
@@ -506,6 +536,7 @@ class MainWindow(QMainWindow):
         self.subtitle_editor.style_clicked.connect(self._open_style_dialog)
         self.video_player.overlay_canvas.style_edit_requested.connect(self._open_style_dialog)
         self.video_player.overlay_canvas.delete_sub_requested.connect(self._delete_active_subtitle)
+        self.video_player.overlay_canvas.subtitle_font_size_changed.connect(self._on_subtitle_font_size_changed)
         self.timeline_widget.seek_requested.connect(self.video_player.seek)
         self.timeline_widget.generate_transcript_clicked.connect(self._start_transcription)
         self.timeline_widget.translate_clicked.connect(self._start_translation)
@@ -522,13 +553,12 @@ class MainWindow(QMainWindow):
         # Load stored subtitle style from database into overlay canvas
         self.video_player.overlay_canvas.load_style_from_db(self.db)
 
-        # Auto-restore last selected video path on app launch
-        last_video = self.db.get_setting("last_video_path", "")
-        if last_video and os.path.exists(last_video):
-            self.video_player.load_video(last_video)
-
     def _update_status_bar_badges(self):
-        stt_m = self.db.get_setting("whisper_model", "Whisper Base")
+        stt_engine = self.db.get_setting("stt_engine", "Gemini (Cloud — Recommended)")
+        if stt_engine.startswith("Gemini"):
+            stt_m = self.db.get_setting("gemini_stt_model_label", "Gemini 2.5 Flash")
+        else:
+            stt_m = self.db.get_setting("whisper_model", "Whisper Large v3")
         trans_m = self.db.get_setting("ai_model", "Gemini 2.5 Flash")
         keys_count = len(self.db.get_gemini_keys(enabled_only=True))
         
@@ -581,6 +611,9 @@ class MainWindow(QMainWindow):
     def _apply_style_config(self):
         cfg = self._get_style_config()
         self.video_player.overlay_canvas.set_subtitle_style_config(cfg)
+
+    def _on_subtitle_font_size_changed(self, new_size: int):
+        self.db.set_setting("sub_font_size", str(new_size))
 
     def _delete_active_subtitle(self):
         active_id = self.video_player.overlay_canvas.active_sub_id
@@ -637,7 +670,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.hide()
         self.status_bar.showMessage("Video & audio ready. Select STT Model and click '🎙️ Generate Transcript' to scan video speech.")
 
-    def _start_transcription(self, model_name: str):
+    def _start_transcription(self):
         if not self.current_project.video_path:
             QMessageBox.warning(self, "Warning", "Please load a video first.")
             return
@@ -647,16 +680,52 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", "Audio is still extracting from video. Please wait a moment.")
             return
 
+        lang_label = self.db.get_setting("stt_language", "Auto Detect")
+        lang_codes = {"Chinese": "zh", "English": "en", "Japanese": "ja", "Korean": "ko"}
+        if lang_label == "Custom":
+            language = self.db.get_setting("custom_stt_language", "").strip() or None
+        else:
+            language = lang_codes.get(lang_label)  # None (auto-detect) for "Auto Detect"
+
+        engine = self.db.get_setting("stt_engine", "Whisper (Local)")
         self.progress_bar.show()
-        self.status_bar.showMessage(f"Scanning video audio with STT Model [{model_name}]...")
-        self.whisper_worker = WhisperWorker(
-            audio_path=wav_path,
-            model_size=model_name
-        )
+        self.timeline_widget.set_transcribing(True)
+
+        if engine.startswith("Gemini"):
+            model_name = self.db.get_setting("gemini_stt_model", "gemini-2.5-flash")
+            self.status_bar.showMessage(f"Scanning video audio with Gemini [{model_name}]...")
+            self.whisper_worker = GeminiSTTWorker(
+                audio_path=wav_path,
+                model_name=model_name,
+                language=language,
+                db=self.db
+            )
+        else:
+            model_size = self.db.get_setting("whisper_model", "Whisper Large v3 — Best Accuracy, Slowest")
+            enable_vad = self.db.get_setting("enable_vad", "true") == "true"
+            self.status_bar.showMessage(f"Scanning video audio with local STT [{model_size}]...")
+            self.whisper_worker = WhisperWorker(
+                audio_path=wav_path,
+                model_size=model_size,
+                language=language,
+                enable_vad=enable_vad
+            )
+
         self.whisper_worker.progress.connect(self._update_progress)
+        self.whisper_worker.detected_language.connect(self._on_stt_language_detected)
         self.whisper_worker.finished.connect(self._on_whisper_finished)
-        self.whisper_worker.failed.connect(self._on_worker_failed)
+        self.whisper_worker.failed.connect(self._on_stt_failed)
         self.whisper_worker.start()
+
+    def _on_stt_failed(self, err_msg: str):
+        self.timeline_widget.set_transcribing(False)
+        self._on_worker_failed(err_msg)
+
+    def _on_stt_language_detected(self, lang_code: str):
+        # Whether picked explicitly or auto-detected, this is the real source language —
+        # translation must use it instead of assuming Chinese, so English-source movies
+        # translate correctly instead of being mistranslated as Chinese.
+        self._source_lang_code = lang_code
 
     def _update_progress(self, pct: int, msg: str):
         self.progress_bar.setValue(pct)
@@ -664,6 +733,7 @@ class MainWindow(QMainWindow):
 
     def _on_whisper_finished(self, subtitles: List[SubtitleItem]):
         self.progress_bar.hide()
+        self.timeline_widget.set_transcribing(False)
         self.status_bar.showMessage("Speech Recognition complete. Auto-detecting VoxcM2 speaker roles...")
         from .editor import auto_detect_speaker_voice
         for sub in subtitles:
@@ -679,6 +749,8 @@ class MainWindow(QMainWindow):
             return
 
         self.progress_bar.show()
+        lang_names = {"zh": "Chinese", "en": "English", "ja": "Japanese", "ko": "Korean"}
+        source_lang = lang_names.get(self._source_lang_code, self._source_lang_code)
         self.trans_worker = TranslationWorker(
             subtitles=self.subtitles,
             engine_name=self.db.get_setting("ai_provider", "Gemini"),
@@ -686,7 +758,8 @@ class MainWindow(QMainWindow):
             model_name=self.db.get_setting("ai_model", "gemini-2.5-flash"),
             custom_prompt=self.db.get_setting("system_prompt", ""),
             cache_mgr=self.cache_mgr,
-            db=self.db
+            db=self.db,
+            source_lang=source_lang
         )
         self.trans_worker.progress.connect(self._update_progress)
         self.trans_worker.line_translated.connect(self.subtitle_editor.update_single_translation)
@@ -797,7 +870,10 @@ class MainWindow(QMainWindow):
             "y": canvas.blur_y_pct,
             "w": canvas.blur_w_pct,
             "h": canvas.blur_h_pct,
-            "enabled": canvas.blur_enabled
+            "enabled": canvas.blur_enabled,
+            "radius": canvas.blur_radius,
+            "color": canvas.blur_color,
+            "opacity": canvas.blur_opacity
         }
 
         lead_text = self.timeline_widget.combo_lead_offset.currentText()

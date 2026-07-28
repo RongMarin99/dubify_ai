@@ -152,7 +152,7 @@ class TimelineCanvas(QWidget):
 
 class TimelineWidget(QWidget):
     seek_requested = Signal(int)
-    generate_transcript_clicked = Signal(str)  # stt_model
+    generate_transcript_clicked = Signal()  # engine/model now comes from Settings
     translate_clicked = Signal()
     generate_audio_clicked = Signal()
 
@@ -174,21 +174,11 @@ class TimelineWidget(QWidget):
         self.lbl_timecode = QLabel("00:00 / 00:00")
         self.lbl_timecode.setStyleSheet("color: #dcdde1; font-family: monospace;")
 
-        # STT Model Selector (Whisper, Qwen3-ASR Flash, Google Chirp 3, Soniox Speech AI)
-        self.combo_stt_model = QComboBox()
-        self.combo_stt_model.addItems([
-            "Whisper large-v3",
-            "Qwen3-ASR Flash (Alibaba)",
-            "Google Chirp 3 ASR",
-            "Soniox Speech AI",
-            "Whisper medium",
-            "Whisper base",
-            "Whisper small",
-            "Whisper tiny"
-        ])
-
+        # STT engine/model is configured once in Settings > Transcript (STT) — no
+        # picker here, just click and go. Button shows a loading state while running.
         self.btn_gen_transcript = QPushButton("🎙️ Generate Transcript")
         self.btn_gen_transcript.setObjectName("ActionBtn")
+        self.btn_gen_transcript.setToolTip("Uses the STT engine/model set in Settings > Transcript (STT).")
 
         # Audio Timing Offset Dropdown
         self.combo_lead_offset = QComboBox()
@@ -217,7 +207,6 @@ class TimelineWidget(QWidget):
         tb_layout.addWidget(self.lbl_title)
         tb_layout.addWidget(self.lbl_timecode)
         tb_layout.addSpacing(10)
-        tb_layout.addWidget(self.combo_stt_model)
         tb_layout.addWidget(self.btn_gen_transcript)
         tb_layout.addSpacing(10)
         tb_layout.addWidget(self.combo_lang)
@@ -236,7 +225,7 @@ class TimelineWidget(QWidget):
         layout.addWidget(self.canvas)
 
         # Connect Signals
-        self.btn_gen_transcript.clicked.connect(lambda: self.generate_transcript_clicked.emit(self.combo_stt_model.currentText()))
+        self.btn_gen_transcript.clicked.connect(self.generate_transcript_clicked.emit)
         self.btn_translate.clicked.connect(self.translate_clicked)
         self.btn_audio.clicked.connect(self.generate_audio_clicked)
         self.slider_zoom.valueChanged.connect(self.canvas.set_zoom)
@@ -245,6 +234,14 @@ class TimelineWidget(QWidget):
 
     def load_subtitles(self, subtitles: List[SubtitleItem]):
         self.canvas.set_subtitles(subtitles)
+
+    def set_transcribing(self, active: bool, status: str = ""):
+        if active:
+            self.btn_gen_transcript.setEnabled(False)
+            self.btn_gen_transcript.setText(f"⏳ {status or 'Transcribing...'}")
+        else:
+            self.btn_gen_transcript.setEnabled(True)
+            self.btn_gen_transcript.setText("🎙️ Generate Transcript")
 
     def update_playhead(self, time_ms: int, duration_ms: int):
         self.canvas.set_duration(duration_ms)

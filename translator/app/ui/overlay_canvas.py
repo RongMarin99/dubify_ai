@@ -1,7 +1,7 @@
 import os
 from typing import Optional, List, Dict, Any
 from PySide6.QtWidgets import QWidget
-from PySide6.QtCore import Qt, QRectF, QPointF, Signal
+from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QTimer
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QFont, QPixmap, QBrush, QImage,
     QDragEnterEvent, QDropEvent, QFontMetrics, QPainterPath,
@@ -13,6 +13,7 @@ from ..model.models import SubtitleItem
 
 class VideoOverlayCanvas(QWidget):
     subtitle_pos_changed = Signal(float, float)  # x_pct, y_pct
+    subtitle_font_size_changed = Signal(int)     # new sub_font_size after resize drag
     subtitle_selected = Signal(bool)             # is_selected
     style_edit_requested = Signal()
     delete_sub_requested = Signal()
@@ -73,15 +74,14 @@ class VideoOverlayCanvas(QWidget):
         self.blur_y_pct: float = 0.10
         self.blur_w_pct: float = 0.40
         self.blur_h_pct: float = 0.18
-        self.blur_color: str = "#0f0f19"        # Default dark frosted blur background
-        self.blur_opacity: float = 0.85          # Default 85% opacity (customizable transparent to solid)
+        self.blur_color: str = "#141419"        # Default dark frosted glass tint
+        self.blur_opacity: float = 0.18          # Default 18% opacity — glass, not a solid box
 
         # Drama & Hardcoded Subtitle Blur Presets
         self.blur_preset: str = "standard"       # "standard" (22px) or "heavy" (30px)
         self.blur_radius: float = 22.0           # 22px Standard, 30px Heavy
         self.feather_radius: float = 18.0        # 18px Standard, 24px Heavy
         self.corner_radius: float = 8.0          # 8px Corner Radius
-        self.blur_bg_tint: QColor = QColor(20, 20, 25, 46)  # rgba(20, 20, 25, 0.18)
 
         # Blur Effect PNG Image Asset (User provided asset: blur_effect.png)
         self.blur_mask_pixmap: Optional[QPixmap] = None
@@ -93,9 +93,24 @@ class VideoOverlayCanvas(QWidget):
             self.blur_mask_pixmap = QPixmap(asset_path_2)
 
         # Drag Interaction State
-        self._dragging_target: Optional[str] = None  # "sub", "logo", "logo_resize", "blur", "blur_resize"
+        self._dragging_target: Optional[str] = None  # "sub", "sub_resize", "logo", "logo_resize", "blur", "blur_resize"
         self._drag_start_pos: QPointF = QPointF()
         self._element_start_rect: QRectF = QRectF()
+        self._element_start_font_size: int = 24
+
+        # Callable(QRectF) -> Optional[QImage]: supplies the live video frame under a
+        # rect (in this widget's own coordinates) so the blur box can preview a real blur.
+        self._frame_provider = None
+        self._blur_preview_cache: Optional[QImage] = None
+
+        # Refreshing the blur preview briefly hides/shows the overlay proxy (see
+        # grab_scene_region) — doing that synchronously inside paintEvent() flickered
+        # the widget's visibility on every update(), which killed the mouse grab mid-drag.
+        # A timer decouples the grab from paint/mouse handling; it skips while dragging.
+        self._blur_preview_timer = QTimer(self)
+        self._blur_preview_timer.setInterval(200)
+        self._blur_preview_timer.timeout.connect(self._refresh_blur_preview)
+        self._blur_preview_timer.start()
 
     def load_blur_image(self, image_path: str):
         """Load a custom blur mask texture image."""
@@ -106,31 +121,39 @@ class VideoOverlayCanvas(QWidget):
                 self.update()
 
     def set_blur_preset(self, preset_name: str):
-        """Toggle between Pure Transparent, Standard Drama (22px), Heavy Chinese (30px), and Dark Banner Mask."""
+        """Toggle between Pure Transparent, Standard Drama (22px), Heavy Chinese (30px), and Dark Banner Mask.
+
+        Drives blur_color/blur_opacity directly — those are the values actually painted
+        in the preview AND baked into the exported video, so preset == final result.
+        """
         if preset_name == "banner":
             self.blur_preset = "banner"
             self.blur_radius = 25.0
             self.feather_radius = 12.0
             self.corner_radius = 8.0
-            self.blur_bg_tint = QColor(10, 10, 15, 240)   # Solid Dark Mask Box (rgba(10, 10, 15, 0.95))
+            self.blur_color = "#0a0a0f"
+            self.blur_opacity = 0.94                    # Solid dark mask box (intentionally opaque)
         elif preset_name == "transparent":
             self.blur_preset = "transparent"
             self.blur_radius = 22.0
             self.feather_radius = 18.0
             self.corner_radius = 8.0
-            self.blur_bg_tint = QColor(0, 0, 0, 0)       # 100% Transparent Glass Blur (0% Tint)
+            self.blur_color = "#000000"
+            self.blur_opacity = 0.0                      # 100% transparent glass blur (0% tint)
         elif preset_name == "heavy":
             self.blur_preset = "heavy"
             self.blur_radius = 30.0
             self.feather_radius = 24.0
             self.corner_radius = 8.0
-            self.blur_bg_tint = QColor(15, 15, 20, 56)   # rgba(15, 15, 20, 0.22)
+            self.blur_color = "#0f0f14"
+            self.blur_opacity = 0.22
         else:
             self.blur_preset = "standard"
             self.blur_radius = 22.0
             self.feather_radius = 18.0
             self.corner_radius = 8.0
-            self.blur_bg_tint = QColor(20, 20, 25, 46)   # rgba(20, 20, 25, 0.18)
+            self.blur_color = "#141419"
+            self.blur_opacity = 0.18
         self.update()
 
     def set_blur_color(self, color_hex: str, opacity: float = 0.85):
@@ -138,6 +161,39 @@ class VideoOverlayCanvas(QWidget):
         self.blur_color = color_hex
         self.blur_opacity = max(0.0, min(1.0, opacity))
         self.update()
+
+    def set_frame_provider(self, fn):
+        """Register the callback used to grab a live video frame for the blur preview."""
+        self._frame_provider = fn
+
+    def _refresh_blur_preview(self):
+        if not self.blur_enabled or self._dragging_target is not None:
+            return
+        provider = self._frame_provider
+        if provider is None:
+            return
+        W = float(max(1, self.width()))
+        H = float(max(1, self.height()))
+        blur_rect = QRectF(self.blur_x_pct * W, self.blur_y_pct * H, self.blur_w_pct * W, self.blur_h_pct * H)
+        frame = provider(blur_rect)
+        if frame is not None and not frame.isNull():
+            self._blur_preview_cache = self._fast_blur_image(frame, self.blur_radius)
+            self.update()
+
+    @staticmethod
+    def _fast_blur_image(image: QImage, radius: float) -> QImage:
+        """Cheap, strong-looking blur: downscale then upscale with smooth interpolation.
+        Real per-pixel gaussian would be too slow to run on every repaint during playback;
+        this downsample trick is the standard fast approximation and matches what the
+        ffmpeg boxblur export produces closely enough for a live preview."""
+        w, h = image.width(), image.height()
+        if w <= 0 or h <= 0:
+            return image
+        factor = max(2, int(max(1.0, radius) / 3))
+        small_w = max(1, w // factor)
+        small_h = max(1, h // factor)
+        small = image.scaled(small_w, small_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        return small.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
 
     def set_video_loaded(self, loaded: bool):
         self.video_has_loaded = loaded
@@ -245,10 +301,13 @@ class VideoOverlayCanvas(QWidget):
         self.update()
 
     def add_blur_region(self):
-        self.blur_x_pct = 0.30  # Centered directly over video stream
-        self.blur_y_pct = 0.10  # Upper part of video stream
-        self.blur_w_pct = 0.40  # 40% width centered
-        self.blur_h_pct = 0.18
+        """One-click default: a wide band over the bottom safe area, where hardcoded
+        source subtitles actually live — so most of the time no drag/resize is needed."""
+        self.blur_x_pct = 0.08
+        self.blur_y_pct = 0.78
+        self.blur_w_pct = 0.84
+        self.blur_h_pct = 0.16
+        self.set_blur_preset("standard")  # guaranteed-good glass look, not whatever was left over
         self.video_has_loaded = True
         self.set_blur_enabled(True)
         self.show()
@@ -339,14 +398,40 @@ class VideoOverlayCanvas(QWidget):
             blur_rect = QRectF(bx, by, bw, bh)
 
             path = QPainterPath()
-            path.addRoundedRect(blur_rect, 8.0, 8.0)
+            path.addRoundedRect(blur_rect, self.corner_radius, self.corner_radius)
 
-            # Clean Semi-Transparent Identification Overlay (rgba(124, 77, 255, 0.15) / 15% Alpha)
-            # Lets users clearly identify the blur area without obscuring the video underneath
-            tint_col = QColor(124, 77, 255, 38)  # 15% alpha
-            painter.fillPath(path, tint_col)
+            painter.save()
+            painter.setClipPath(path)
 
-            # Solid Purple Selection Border (#7C4DFF, Active/Hover #8B5CF6, 8px Rounded Rect)
+            # Live frosted glass — draw the cached blurred frame (refreshed on a timer,
+            # not synchronously here — see _refresh_blur_preview for why).
+            blurred_frame = self._blur_preview_cache
+
+            if blurred_frame is not None:
+                painter.drawImage(blur_rect, blurred_frame)
+            else:
+                # No live frame yet (video not loaded) — dim placeholder so the box isn't empty
+                painter.fillRect(blur_rect, QColor(30, 30, 36, 160))
+
+            # Frosted color tint on top of the real blur (adds the glass color cast)
+            glass_col = QColor(self.blur_color)
+            glass_col.setAlphaF(self.blur_opacity)
+            painter.fillRect(blur_rect, glass_col)
+
+            # Glass shine — soft light gradient across the top half (real "glass panel" look)
+            shine = QLinearGradient(blur_rect.topLeft(), QPointF(blur_rect.left(), blur_rect.top() + blur_rect.height() * 0.6))
+            shine.setColorAt(0.0, QColor(255, 255, 255, 46))
+            shine.setColorAt(1.0, QColor(255, 255, 255, 0))
+            painter.fillRect(blur_rect, QBrush(shine))
+
+            painter.restore()
+
+            # Thin bright edge highlight along the top (glass rim reflection)
+            painter.setPen(QPen(QColor(255, 255, 255, 60), 1))
+            painter.drawLine(QPointF(blur_rect.left() + self.corner_radius, blur_rect.top() + 1),
+                              QPointF(blur_rect.right() - self.corner_radius, blur_rect.top() + 1))
+
+            # Selection border (editing-mode indicator only, not baked into export)
             border_color = QColor("#8B5CF6") if getattr(self, '_hover_blur', False) else QColor("#7C4DFF")
             painter.setPen(QPen(border_color, 2, Qt.SolidLine))
             painter.drawPath(path)
@@ -421,20 +506,19 @@ class VideoOverlayCanvas(QWidget):
         if self.is_sub_visible and self.sub_text:
             self._render_subtitle_overlay(painter, W, H)
 
-    def _render_subtitle_overlay(self, painter: QPainter, W: float, H: float):
-        # Configure Font
+    def _measure_subtitle_box(self, W: float, H: float):
+        """Compute subtitle box geometry — shared by paint() AND hit-testing so the
+        drag/resize handles always line up with what's actually drawn."""
         font_weight = QFont.Bold if self.sub_bold else QFont.Normal
         scale_ratio = H / 720.0  # Scale font proportionally to container height
         rel_font_size = max(14, int(self.sub_font_size * max(0.6, scale_ratio)))
-        
+
         font = QFont(self.sub_font_family, rel_font_size, font_weight)
         font.setItalic(self.sub_italic)
-        painter.setFont(font)
+        metrics = QFontMetrics(font)
 
-        metrics = painter.fontMetrics()
-        
         # Automatic Line Wrapping (Max 2 lines)
-        lines = self.sub_text.splitlines()
+        lines = self.sub_text.splitlines() or [""]
         if len(lines) == 1 and len(self.sub_text) > 42:
             mid = len(self.sub_text) // 2
             space_idx = self.sub_text.find(" ", mid)
@@ -462,6 +546,11 @@ class VideoOverlayCanvas(QWidget):
         sx = max(10, min(W - total_width - 10, sx))
         sy = max(10, min(H - total_height - 10, sy))
 
+        return sx, sy, total_width, total_height, lines, line_height, font, metrics
+
+    def _render_subtitle_overlay(self, painter: QPainter, W: float, H: float):
+        sx, sy, total_width, total_height, lines, line_height, font, metrics = self._measure_subtitle_box(W, H)
+        painter.setFont(font)
         sub_rect = QRectF(sx, sy, total_width, total_height)
 
         # 3A. Background Box
@@ -494,6 +583,14 @@ class VideoOverlayCanvas(QWidget):
             del_btn_rect = QRectF(sx + total_width - 16, sy - 24, 20, 20)
             painter.fillRect(del_btn_rect, QColor("#ef4444"))
             painter.drawText(del_btn_rect, Qt.AlignCenter, "✖")
+
+            # Resize Handle (⤡) Bottom Right — drag to scale subtitle font size
+            resize_rect = QRectF(sx + total_width - 12, sy + total_height - 12, 16, 16)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor("#3b82f6")))
+            painter.drawEllipse(resize_rect)
+            painter.setPen(QPen(QColor("#ffffff"), 1.5))
+            painter.drawLine(resize_rect.center() + QPointF(-4, 4), resize_rect.center() + QPointF(4, -4))
 
             painter.setFont(font)  # Restore font
 
@@ -537,6 +634,55 @@ class VideoOverlayCanvas(QWidget):
             if not self.video_has_loaded:
                 self.upload_clicked.emit()
                 return
+
+            # Subtitle Overlay hit test — checked FIRST: subtitles paint on top of the
+            # blur box (paint() renders blur, then logo, then subtitle last), so when
+            # the two overlap, the subtitle must win the click, not the blur box under it.
+            # Geometry matches _render_subtitle_overlay exactly.
+            if self.is_sub_visible and self.sub_text:
+                sx, sy, tw, th, _lines, _lh, _font, _metrics = self._measure_subtitle_box(W, H)
+                sub_rect = QRectF(sx, sy, tw, th)
+
+                # Check Style, Delete & Resize handles on selection box
+                if self.is_sub_selected:
+                    if QRectF(sx + tw - 40, sy - 24, 20, 20).contains(pos):
+                        self.style_edit_requested.emit()
+                        return
+                    elif QRectF(sx + tw - 16, sy - 24, 20, 20).contains(pos):
+                        self.delete_sub_requested.emit()
+                        return
+                    elif QRectF(sx + tw - 14, sy + th - 14, 20, 20).contains(pos):
+                        self._dragging_target = "sub_resize"
+                        self._drag_start_pos = pos
+                        self._element_start_rect = QRectF(sx, sy, tw, th)
+                        self._element_start_font_size = self.sub_font_size
+                        return
+
+                if sub_rect.contains(pos) or not (self.logo_enabled or self.blur_enabled):
+                    self.is_sub_selected = True
+                    self.subtitle_selected.emit(True)
+                    self._dragging_target = "sub"
+                    self._drag_start_pos = pos
+                    self._element_start_rect = QRectF(sx, sy, tw, th)
+                    self.update()
+                    return
+
+            # Logo handles hit test
+            if self.logo_enabled:
+                lx = self.logo_x_pct * W
+                ly = self.logo_y_pct * H
+                lw = self.logo_w_pct * W
+                lh = self.logo_h_pct * H
+                if QRectF(lx + lw - 15, ly + lh - 15, 20, 20).contains(pos):
+                    self._dragging_target = "logo_resize"
+                    self._drag_start_pos = pos
+                    self._element_start_rect = QRectF(lx, ly, lw, lh)
+                    return
+                elif QRectF(lx, ly, lw, lh).contains(pos):
+                    self._dragging_target = "logo"
+                    self._drag_start_pos = pos
+                    self._element_start_rect = QRectF(lx, ly, lw, lh)
+                    return
 
             # Blur handles hit test
             if self.blur_enabled:
@@ -596,49 +742,6 @@ class VideoOverlayCanvas(QWidget):
                     self._dragging_target = "blur"
                     self._drag_start_pos = pos
                     self._element_start_rect = QRectF(bx, by, bw, bh)
-                    return
-
-            # Logo handles hit test
-            if self.logo_enabled:
-                lx = self.logo_x_pct * W
-                ly = self.logo_y_pct * H
-                lw = self.logo_w_pct * W
-                lh = self.logo_h_pct * H
-                if QRectF(lx + lw - 15, ly + lh - 15, 20, 20).contains(pos):
-                    self._dragging_target = "logo_resize"
-                    self._drag_start_pos = pos
-                    self._element_start_rect = QRectF(lx, ly, lw, lh)
-                    return
-                elif QRectF(lx, ly, lw, lh).contains(pos):
-                    self._dragging_target = "logo"
-                    self._drag_start_pos = pos
-                    self._element_start_rect = QRectF(lx, ly, lw, lh)
-                    return
-
-            # Subtitle Overlay hit test
-            if self.is_sub_visible and self.sub_text:
-                tw = 300
-                th = 60
-                sx = self.sub_x_pct * W - (tw / 2.0)
-                sy = self.sub_y_pct * H - (th / 2.0)
-                sub_rect = QRectF(sx, sy, tw, th)
-
-                # Check Style & Delete action buttons on selection box
-                if self.is_sub_selected:
-                    if QRectF(sx + tw - 40, sy - 24, 20, 20).contains(pos):
-                        self.style_edit_requested.emit()
-                        return
-                    elif QRectF(sx + tw - 16, sy - 24, 20, 20).contains(pos):
-                        self.delete_sub_requested.emit()
-                        return
-
-                if sub_rect.contains(pos) or not (self.logo_enabled or self.blur_enabled):
-                    self.is_sub_selected = True
-                    self.subtitle_selected.emit(True)
-                    self._dragging_target = "sub"
-                    self._drag_start_pos = pos
-                    self._element_start_rect = QRectF(sx, sy, tw, th)
-                    self.update()
                     return
 
             # Clicked empty canvas
@@ -714,6 +817,14 @@ class VideoOverlayCanvas(QWidget):
             self.blur_changed.emit(self.blur_x_pct, self.blur_y_pct, self.blur_w_pct, self.blur_h_pct, self.blur_enabled)
             print(f"[DEBUG LOG] Blur resized BL | pos=({self.blur_x_pct:.3f},{self.blur_y_pct:.3f}) size=({self.blur_w_pct:.3f}x{self.blur_h_pct:.3f})")
 
+        elif self._dragging_target == "sub_resize":
+            start_w = max(1.0, self._element_start_rect.width())
+            new_w = max(60.0, self._element_start_rect.width() + delta_x)
+            scale = new_w / start_w
+            new_size = int(max(12, min(96, round(self._element_start_font_size * scale))))
+            if new_size != self.sub_font_size:
+                self.sub_font_size = new_size
+
         elif self._dragging_target == "logo":
             new_x = self._element_start_rect.x() + delta_x
             new_y = self._element_start_rect.y() + delta_y
@@ -732,4 +843,9 @@ class VideoOverlayCanvas(QWidget):
         self.raise_()
 
     def mouseReleaseEvent(self, event):
+        if self._dragging_target == "sub_resize":
+            self.subtitle_font_size_changed.emit(self.sub_font_size)
+        was_blur_drag = isinstance(self._dragging_target, str) and self._dragging_target.startswith("blur")
         self._dragging_target = None
+        if was_blur_drag:
+            self._refresh_blur_preview()  # snap preview to the new box immediately
