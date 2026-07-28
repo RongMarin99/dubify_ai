@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QLabel, QPushButton, QFileDialog, QProgressBar, QStatusBar,
     QMessageBox, QSlider, QFrame, QMenu, QMenuBar, QComboBox, QDialog,
-    QGraphicsView, QGraphicsScene, QColorDialog
+    QGraphicsView, QGraphicsScene, QColorDialog, QCheckBox
 )
 from PySide6.QtCore import Qt, QUrl, QTimer, QSize, Signal, QRectF
 from PySide6.QtGui import QIcon, QFont, QDragEnterEvent, QDropEvent, QPainter, QColor, QImage
