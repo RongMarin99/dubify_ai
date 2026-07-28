@@ -60,6 +60,31 @@ class WhisperModelDownloadThread(QThread):
             self.failed.emit(str(e))
 
 
+class TTSModelDownloadThread(QThread):
+    """Loads sumnim/VoxCPM2-Khmer once, forcing the weights to download + cache.
+    Real failure surfaces here (missing 'voxcpm' package, no CUDA, etc.) instead of
+    only showing up later mid-generation."""
+    finished_ok = Signal()
+    failed = Signal(str)
+
+    def run(self):
+        from ..core.tts import has_nvidia_gpu
+        if not has_nvidia_gpu():
+            self.failed.emit(
+                "No NVIDIA/CUDA GPU detected on this machine (checked via nvidia-smi). "
+                "VoxCPM2 requires CUDA >=12.0 in practice — this isn't a missing-package "
+                "issue, it genuinely can't run on integrated/non-NVIDIA graphics. "
+                "Installing 'voxcpm' here would not change that."
+            )
+            return
+        try:
+            from voxcpm import VoxCPM
+            VoxCPM.from_pretrained("sumnim/VoxCPM2-Khmer")
+            self.finished_ok.emit()
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 class SettingsNavItemWidget(QFrame):
     clicked = Signal(int)
 
@@ -310,9 +335,11 @@ class SettingsDialog(QDialog):
 
         item_stt = SettingsNavItemWidget(0, "🎙️", "Transcript (STT)", "Whisper, VoxcM2 & VAD")
         item_trans = SettingsNavItemWidget(1, "🌐", "Translation Engine", "Gemini 2.5 & Cloud AI")
+        item_tts = SettingsNavItemWidget(2, "🔊", "Voice (TTS)", "VoxCPM2, CosyVoice & Edge-TTS")
 
         sidebar_layout.addWidget(item_stt)
         sidebar_layout.addWidget(item_trans)
+        sidebar_layout.addWidget(item_tts)
 
         # Separator line
         sep = QFrame()
@@ -325,15 +352,15 @@ class SettingsDialog(QDialog):
         sec2_lbl.setStyleSheet("font-size: 10px; font-weight: 700; color: #64748b; padding-left: 8px; margin-top: 4px; margin-bottom: 2px;")
         sidebar_layout.addWidget(sec2_lbl)
 
-        item_keys = SettingsNavItemWidget(2, "🔑", "Gemini API Keys", "Rotation & Load Balancer")
-        item_local = SettingsNavItemWidget(3, "💻", "Local Models", "Ollama & Offline Models")
-        item_perf = SettingsNavItemWidget(4, "⚡", "Performance", "CUDA, VRAM & Threads")
+        item_keys = SettingsNavItemWidget(3, "🔑", "Gemini API Keys", "Rotation & Load Balancer")
+        item_local = SettingsNavItemWidget(4, "💻", "Local Models", "Ollama & Offline Models")
+        item_perf = SettingsNavItemWidget(5, "⚡", "Performance", "CUDA, VRAM & Threads")
 
         sidebar_layout.addWidget(item_keys)
         sidebar_layout.addWidget(item_local)
         sidebar_layout.addWidget(item_perf)
 
-        self.nav_items = [item_stt, item_trans, item_keys, item_local, item_perf]
+        self.nav_items = [item_stt, item_trans, item_tts, item_keys, item_local, item_perf]
         for nav_item in self.nav_items:
             nav_item.clicked.connect(self._select_nav_page)
 
@@ -367,15 +394,17 @@ class SettingsDialog(QDialog):
 
         self.stack = QStackedWidget()
 
-        # Create 5 Pages
+        # Create 6 Pages
         self.page_stt = self._create_stt_page()
         self.page_trans = self._create_trans_page()
+        self.page_tts = self._create_tts_page()
         self.page_keys = self._create_keys_page()
         self.page_local = self._create_local_page()
         self.page_perf = self._create_perf_page()
 
         self.stack.addWidget(self.page_stt)
         self.stack.addWidget(self.page_trans)
+        self.stack.addWidget(self.page_tts)
         self.stack.addWidget(self.page_keys)
         self.stack.addWidget(self.page_local)
         self.stack.addWidget(self.page_perf)
@@ -672,7 +701,94 @@ class SettingsDialog(QDialog):
         return page
 
     # ----------------------------------------------------
-    # SECTION 3: Gemini API Keys Manager
+    # SECTION 3: Voice Synthesis (TTS)
+    # ----------------------------------------------------
+    def _create_tts_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        grp_engine = QGroupBox("Voice Synthesis Engine (TTS)")
+        fl = QVBoxLayout(grp_engine)
+        fl.setSpacing(8)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Engine:"))
+        self.combo_tts_engine = QComboBox()
+        self.combo_tts_engine.addItems([
+            "VoxCPM2-Khmer (Recommended — Most Realistic, Requires GPU)",
+            "CosyVoice 2 Local (Advanced, Requires Local Model)",
+            "Edge-TTS (Cloud/Free — Always Works, No GPU Needed)"
+        ])
+        self.combo_tts_engine.currentTextChanged.connect(self._on_tts_engine_changed)
+        row1.addWidget(self.combo_tts_engine, 1)
+
+        self.btn_download_tts_model = QPushButton("📥 Download / Verify Model")
+        self.btn_download_tts_model.setObjectName("btnPrimary")
+        self.btn_download_tts_model.clicked.connect(self._on_download_tts_model)
+        row1.addWidget(self.btn_download_tts_model)
+
+        fl.addLayout(row1)
+
+        tts_note = QLabel(
+            "VoxCPM2-Khmer (sumnim/VoxCPM2-Khmer) gives the most realistic, natural-sounding "
+            "Khmer dubbing — a real diffusion TTS model, not a robotic cloud voice. It needs a "
+            "CUDA GPU (~8GB VRAM) and the 'voxcpm' + 'torch' packages; if it can't load (no GPU, "
+            "package missing, etc.) generation automatically falls back to Edge-TTS for that line "
+            "instead of failing, so it's always safe to leave selected."
+        )
+        tts_note.setWordWrap(True)
+        tts_note.setStyleSheet("color: #8c89b4; font-size: 11px;")
+        fl.addWidget(tts_note)
+
+        layout.addWidget(grp_engine)
+        layout.addStretch()
+        return page
+
+    def _on_tts_engine_changed(self, label: str):
+        needs_download = "VoxCPM2" in label or "CosyVoice" in label
+        self.btn_download_tts_model.setEnabled(needs_download)
+        self.btn_download_tts_model.setText("📥 Download / Verify Model" if needs_download else "☁️ Cloud (No Download Needed)")
+
+    def _on_download_tts_model(self):
+        label = self.combo_tts_engine.currentText()
+        if "VoxCPM2" not in label:
+            QMessageBox.information(self, "Local Model", f"'{label}' doesn't use a downloadable model here.")
+            return
+
+        self.btn_download_tts_model.setEnabled(False)
+        self.btn_download_tts_model.setText("⏳ Downloading...")
+
+        self._tts_dl_thread = TTSModelDownloadThread()
+        self._tts_dl_thread.finished_ok.connect(self._on_tts_download_ok)
+        self._tts_dl_thread.failed.connect(self._on_tts_download_failed)
+        self._tts_dl_thread.start()
+
+    def _on_tts_download_ok(self):
+        self.btn_download_tts_model.setEnabled(True)
+        self.btn_download_tts_model.setText("📥 Download / Verify Model")
+        QMessageBox.information(self, "Model Ready", "✅ VoxCPM2-Khmer is downloaded and cached — ready for use.")
+
+    def _on_tts_download_failed(self, error: str):
+        self.btn_download_tts_model.setEnabled(True)
+        self.btn_download_tts_model.setText("📥 Download / Verify Model")
+        QMessageBox.warning(self, "Download Failed",
+            f"Could not load VoxCPM2-Khmer:\n{error}\n\n"
+            f"Generation will still work — it automatically falls back to Edge-TTS for lines "
+            f"this engine can't handle.")
+
+    @staticmethod
+    def _tts_engine_id(label: str) -> str:
+        """Map the Voice-tab combo label to the engine string TTSWorker matches on."""
+        if "VoxCPM2" in label:
+            return "VoxCPM2-Khmer"
+        elif "CosyVoice" in label:
+            return "CosyVoice 2 / VoxcM2"
+        return "Edge-TTS"
+
+    # ----------------------------------------------------
+    # SECTION 4: Gemini API Keys Manager
     # ----------------------------------------------------
     def _create_keys_page(self) -> QWidget:
         page = QWidget()
@@ -1095,6 +1211,13 @@ class SettingsDialog(QDialog):
         self.edit_custom_lang.setText(self.db.get_setting("custom_stt_language", ""))
         self.chk_vad.setChecked(self.db.get_setting("enable_vad", "true") == "true")
 
+        # Voice (TTS)
+        tts_label = self.db.get_setting("tts_engine_label", "VoxCPM2-Khmer (Recommended — Most Realistic, Requires GPU)")
+        idx = self.combo_tts_engine.findText(tts_label)
+        if idx != -1:
+            self.combo_tts_engine.setCurrentIndex(idx)
+        self._on_tts_engine_changed(self.combo_tts_engine.currentText())
+
         # Translation
         trans_label = self.db.get_setting("ai_model_label", "Gemini 2.5 Pro (Recommended — Most Natural Khmer)")
         idx = self.combo_trans_engine.findText(trans_label)
@@ -1139,6 +1262,11 @@ class SettingsDialog(QDialog):
         self.db.set_setting("stt_language", self.combo_stt_lang.currentText())
         self.db.set_setting("custom_stt_language", self.edit_custom_lang.text().strip())
         self.db.set_setting("enable_vad", "true" if self.chk_vad.isChecked() else "false")
+
+        # Voice (TTS)
+        tts_label = self.combo_tts_engine.currentText()
+        self.db.set_setting("tts_engine_label", tts_label)
+        self.db.set_setting("tts_engine", self._tts_engine_id(tts_label))
 
         # Translation — store the real API model id separately from the display label.
         # (Previously the full label text like "Gemini 2.5 Flash (Recommended)" was saved

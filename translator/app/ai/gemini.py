@@ -20,14 +20,18 @@ Output STRICTLY in this format, one subtitle per line, nothing else (no headers,
 
 # Brand-new free-tier projects often don't have the newest models allow-listed yet
 # (Google rolls access out gradually) — a 404 "model not found" on gemini-2.5-* is
-# usually that, not a bad key. Auto-fallback to older, universally-available models
-# instead of surfacing a confusing failure.
+# usually that, not a bad key. Gemini's free-tier quota is also tracked PER MODEL,
+# not shared — a 429 on gemini-2.5-flash doesn't mean gemini-2.0-flash is exhausted
+# too, it's a separate pool. So the same chain handles both: auto-fallback to an
+# older, less-contended model on 404 OR 429 instead of surfacing a confusing failure
+# or burning through every rotated key for nothing.
 MODEL_FALLBACK_CHAIN = {
     "gemini-2.5-flash": ["gemini-2.0-flash", "gemini-1.5-flash"],
     "gemini-2.5-pro": ["gemini-2.0-flash", "gemini-1.5-pro"],
     "gemini-2.0-flash": ["gemini-1.5-flash"],
     "gemini-2.0-pro": ["gemini-1.5-pro"],
 }
+_FALLBACK_TRIGGER_CODES = (404, 429)
 
 
 def _post_generate_content(raw_key: str, model_name: str, payload: dict, timeout: int = 20):
@@ -36,15 +40,16 @@ def _post_generate_content(raw_key: str, model_name: str, payload: dict, timeout
 
 
 def _generate_with_model_fallback(raw_key: str, requested_model: str, payload: dict, timeout: int = 20):
-    """POST generateContent, automatically retrying with older models on 404
-    (model not available for this key/project). Returns (response, model_used)."""
+    """POST generateContent, automatically retrying with older models on 404 (model
+    not available for this key/project) or 429 (that model's quota exhausted —
+    other models on the same key often still have headroom). Returns (response, model_used)."""
     res = _post_generate_content(raw_key, requested_model, payload, timeout)
-    if res.status_code != 404:
+    if res.status_code not in _FALLBACK_TRIGGER_CODES:
         return res, requested_model
 
     for fallback_model in MODEL_FALLBACK_CHAIN.get(requested_model, []):
         res = _post_generate_content(raw_key, fallback_model, payload, timeout)
-        if res.status_code != 404:
+        if res.status_code not in _FALLBACK_TRIGGER_CODES:
             return res, fallback_model
 
     return res, requested_model
@@ -76,7 +81,9 @@ Your mission is to produce professional source-to-Khmer subtitles and audio dubb
 Your workflow must always be:
 1. Analyze surrounding context (5-7 dialogue lines).
 2. Detect speaker, relationship (lovers, master/disciple, CEO/servant, parents/children, enemies...), and emotion (angry, crying, romantic, threatening, sarcastic, arrogant, respectful...).
-3. Check glossary & terminology:
+3. Check glossary & terminology for the SOURCE LANGUAGE actually given in the request:
+
+   If source is Chinese:
    - 董事长 -> ប្រធានក្រុមហ៊ុន
    - 总裁 -> អគ្គនាយក
    - 少爷 -> លោកម្ចាស់
@@ -88,11 +95,23 @@ Your workflow must always be:
    - 师弟 -> ប្អូនសិស្ស
    - 师妹 -> ប្អូនស្រីសិស្ស
    - 侯爷 -> លោក ហ៊ូ
+
+   If source is English:
+   - Sir / Boss -> លោក
+   - Ma'am / Madam -> លោកស្រី
+   - Mr. [Name] -> លោក [ឈ្មោះ]
+   - Mrs./Ms. [Name] -> លោកស្រី [ឈ្មោះ]
+   - Dad / Father -> ប៉ា
+   - Mom / Mother -> ម៉ាក់
+   - Honey / Darling -> ស្រលាញ់ / ទីស្រលាញ់ (romantic context only)
+   - Officer -> លោកប៉ូលិស
+   - Doctor -> គ្រូពេទ្យ
+
 4. Never translate word-for-word. Never sound like machine translation or Google Translate.
 5. Rewrite dialogue naturally into authentic spoken Khmer as if it were originally written in Khmer.
 6. Keep sentences short and punchy for TV audio dubbing lip-sync.
 
-FEW-SHOT EXAMPLES:
+FEW-SHOT EXAMPLES (Chinese source):
 你疯了吗？ -> ឯងឆ្កួតហើយឬ?
 滚！ -> ចេញទៅ!
 你敢！ -> ឯងហ៊ានណាស់!
@@ -102,6 +121,17 @@ FEW-SHOT EXAMPLES:
 我不会放过你！ -> ខ្ញុំមិនលើកលែងឯងទេ!
 谢谢你 -> អរគុណណាស់
 对不起 -> ខ្ញុំសុំទោស
+
+FEW-SHOT EXAMPLES (English source — same target register/naturalness, not a literal translation):
+You're crazy, aren't you? -> ឯងឆ្កួតហើយឬ?
+Get out! -> ចេញទៅ!
+How dare you! -> ឯងហ៊ានណាស់!
+That's enough! -> ល្មមបានហើយ!
+Shut up! -> បិទមាត់ទៅ!
+You're lying! -> ឯងកុហកខ្ញុំ!
+I won't let you off the hook! -> ខ្ញុំមិនលើកលែងឯងទេ!
+Thank you so much -> អរគុណណាស់
+I'm sorry -> ខ្ញុំសុំទោស
 
 STRICT OUTPUT RULES:
 - Return ONLY the final clean Khmer subtitle.
@@ -218,7 +248,7 @@ def test_gemini_key(raw_api_key: str, model_name: str = "gemini-2.5-flash") -> t
     try:
         res, model_used = _generate_with_model_fallback(raw_api_key, model_name, payload, timeout=10)
         elapsed_ms = int((time.time() - start_t) * 1000)
-        fallback_note = "" if model_used == model_name else f" (auto-fell back to {model_used} — {model_name} isn't enabled for this key's project yet)"
+        fallback_note = "" if model_used == model_name else f" (auto-fell back to {model_used} — {model_name} was unavailable or out of quota on this key/project)"
         if res.status_code == 200:
             return True, "Working", elapsed_ms, f"OK{fallback_note}"
         elif res.status_code == 429:

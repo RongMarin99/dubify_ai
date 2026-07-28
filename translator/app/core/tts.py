@@ -1,10 +1,27 @@
 import os
 import asyncio
 import hashlib
+import subprocess
 import requests
 from typing import List, Dict, Optional
 from PySide6.QtCore import QThread, Signal
 from ..model.models import SubtitleItem
+
+
+def has_nvidia_gpu() -> bool:
+    """Cheap check for an NVIDIA/CUDA-capable GPU via nvidia-smi, without needing
+    torch installed. VoxCPM2 requires CUDA >=12.0 in practice — on machines with
+    only integrated graphics (Intel/AMD APU), it can never run regardless of which
+    Python packages are installed, so we should say that plainly instead of letting
+    a raw ModuleNotFoundError/CUDA error look like something's broken."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi"], capture_output=True, timeout=3,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 # Enhanced Voice Profiles with custom Pitch & Rate for natural VoxcM2 / CosyVoice 2 & Edge-TTS dubbing
 VOICE_PROFILES = {
@@ -20,6 +37,68 @@ VOICE_PROFILES = {
     "Old Man": {"voice": "km-KH-PisethNeural", "rate": "-8%", "pitch": "-15Hz", "cosy_role": "old_man"},
     "Old Woman": {"voice": "km-KH-SreymomNeural", "rate": "-6%", "pitch": "-10Hz", "cosy_role": "old_woman"}
 }
+
+# Voice-design descriptors — VoxCPM2 has no pitch/rate knobs like Edge-TTS; instead
+# you prefix the text with a natural-language "(voice description)" and the diffusion
+# model synthesizes a matching voice. This keeps our existing voice-profile picker
+# working the same way, just mapped to descriptors instead of Hz/percent values.
+VOXCPM2_VOICE_DESIGN = {
+    "male_lead": "(A calm adult male voice, natural warm tone)",
+    "male_sec": "(An energetic adult male voice, slightly faster pace)",
+    "female_lead": "(A calm adult female voice, natural warm tone)",
+    "female_sec": "(An energetic adult female voice, slightly faster pace)",
+    "child": "(A young child's voice, high-pitched and playful)",
+    "old_man": "(An elderly male voice, slow and gravelly)",
+    "old_woman": "(An elderly female voice, slow and soft)",
+}
+
+
+class VoxCPM2KhmerRunner:
+    """Direct in-process sumnim/VoxCPM2-Khmer synthesis — realistic diffusion-based
+    Khmer TTS. Requires the `voxcpm` package + a CUDA GPU (the official API has no
+    practical CPU path); falls through to Edge-TTS automatically if unavailable."""
+    _instance = None
+    _model = None
+    _load_failed = False
+    _failure_reason = ""
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = VoxCPM2KhmerRunner()
+            cls._instance._init_model()
+        return cls._instance
+
+    def _init_model(self):
+        if not has_nvidia_gpu():
+            self._model = None
+            self._load_failed = True
+            self._failure_reason = "No NVIDIA/CUDA GPU detected on this machine — VoxCPM2 requires one."
+            return
+        try:
+            from voxcpm import VoxCPM
+            self._model = VoxCPM.from_pretrained("sumnim/VoxCPM2-Khmer")
+        except Exception as e:
+            self._model = None
+            self._load_failed = True
+            self._failure_reason = str(e)
+
+    def generate(self, text: str, role_config: dict, output_file: str) -> bool:
+        if self._model is None:
+            return False
+        try:
+            import soundfile as sf
+            descriptor = VOXCPM2_VOICE_DESIGN.get(role_config.get("cosy_role", ""), "")
+            wav = self._model.generate(
+                text=f"{descriptor}{text}" if descriptor else text,
+                cfg_value=2.0,
+                inference_timesteps=10,
+            )
+            sf.write(output_file, wav, self._model.tts_model.sample_rate)
+            return os.path.exists(output_file) and os.path.getsize(output_file) > 0
+        except Exception:
+            return False
+
 
 class CosyVoiceDirectLocalRunner:
     """Direct in-process CosyVoice 2 / VoxcM2 model runner for python main.py."""
@@ -101,12 +180,17 @@ class TTSWorker(QThread):
                 if not os.path.exists(out_path):
                     success = False
 
-                    # 1. Direct In-Process CosyVoice 2 / VoxcM2 PyTorch Model Synthesis
-                    if "CosyVoice" in self.engine or "Voxc" in self.engine:
+                    # 1. sumnim/VoxCPM2-Khmer — real diffusion TTS, most realistic Khmer
+                    if "VoxCPM2" in self.engine:
+                        runner = VoxCPM2KhmerRunner.get_instance()
+                        success = runner.generate(text_to_speak, role_config, out_path)
+
+                    # 2. Direct In-Process CosyVoice 2 PyTorch Model Synthesis
+                    if not success and ("CosyVoice" in self.engine or "Voxc" in self.engine):
                         runner = CosyVoiceDirectLocalRunner.get_instance()
                         success = runner.generate(text_to_speak, item.voice, out_path)
 
-                        # 2. Local HTTP CosyVoice 2 API fallback
+                        # 2b. Local HTTP CosyVoice 2 API fallback
                         if not success:
                             success = self._generate_cosyvoice2_sync(text_to_speak, item.voice, out_path)
 

@@ -787,7 +787,7 @@ class MainWindow(QMainWindow):
         self.tts_worker = TTSWorker(
             subtitles=self.subtitles,
             output_dir="temp",
-            engine=self.db.get_setting("tts_engine", "CosyVoice 2 / VoxcM2"),
+            engine=self.db.get_setting("tts_engine", "VoxCPM2-Khmer"),
             cosyvoice_url=self.db.get_setting("cosyvoice_url", "http://localhost:50000/tts")
         )
         self.tts_worker.progress.connect(self._update_progress)
