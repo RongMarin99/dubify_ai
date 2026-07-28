@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QDialog, QLabel, QComboBox, QDialogButtonBox, QFormLayout
 )
 from PySide6.QtCore import Qt, Signal, QEvent
-from PySide6.QtGui import QKeySequence, QShortcut, QFont
+from PySide6.QtGui import QKeySequence, QShortcut, QFont, QColor
 from ..model.models import SubtitleItem
 
 FEMALE_KEYWORDS = [
@@ -220,6 +220,9 @@ class SubtitleEditorWidget(QWidget):
             # AUDIO STATUS
             status_item = QTableWidgetItem(item.status)
             status_item.setFlags(status_item.flags() & ~Qt.ItemIsEditable)
+            if item.status == "Needs Review":
+                status_item.setForeground(QColor("#f5a623"))
+                status_item.setToolTip("Generated audio didn't match the subtitle text well — consider regenerating this line.")
 
             self.table.setItem(row, 0, start_item)
             self.table.setItem(row, 1, end_item)

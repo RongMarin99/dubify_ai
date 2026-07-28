@@ -111,14 +111,14 @@ class TranslationWorker(QThread):
             self.failed.emit(str(e))
 
     def _create_provider(self) -> BaseAIProvider:
+        # self.model_name is a real API model id here (e.g. "gemini-2.5-pro",
+        # "gpt-4o", "deepseek-chat") — resolved from the Settings combo label
+        # in setting.py, not the raw display label itself.
         if self.engine_name in ["Gemini", "Gemini 2.5 Flash", "Gemini 2.5 Pro"]:
-            m_name = self.model_name
-            if self.engine_name == "Gemini 2.5 Pro":
-                m_name = "gemini-2.5-pro"
-            elif self.engine_name == "Gemini 2.5 Flash":
-                m_name = "gemini-2.5-flash"
-            return GeminiProvider(api_key=self.api_key, model_name=m_name, db=self.db)
-        elif self.engine_name in ["OpenAI", "OpenAI GPT", "DeepSeek"]:
+            return GeminiProvider(api_key=self.api_key, model_name=self.model_name, db=self.db)
+        elif self.engine_name == "DeepSeek":
+            return OpenAIProvider(api_key=self.api_key, base_url="https://api.deepseek.com/v1", model_name=self.model_name)
+        elif self.engine_name in ["OpenAI", "OpenAI GPT"]:
             return OpenAIProvider(api_key=self.api_key, model_name=self.model_name)
         elif self.engine_name in ["Ollama", "Qwen", "Local LLM"]:
             return OllamaProvider(model_name=self.model_name)

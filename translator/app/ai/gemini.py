@@ -18,6 +18,38 @@ Output STRICTLY in this format, one subtitle per line, nothing else (no headers,
 """
 
 
+# Brand-new free-tier projects often don't have the newest models allow-listed yet
+# (Google rolls access out gradually) — a 404 "model not found" on gemini-2.5-* is
+# usually that, not a bad key. Auto-fallback to older, universally-available models
+# instead of surfacing a confusing failure.
+MODEL_FALLBACK_CHAIN = {
+    "gemini-2.5-flash": ["gemini-2.0-flash", "gemini-1.5-flash"],
+    "gemini-2.5-pro": ["gemini-2.0-flash", "gemini-1.5-pro"],
+    "gemini-2.0-flash": ["gemini-1.5-flash"],
+    "gemini-2.0-pro": ["gemini-1.5-pro"],
+}
+
+
+def _post_generate_content(raw_key: str, model_name: str, payload: dict, timeout: int = 20):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={raw_key}"
+    return requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=timeout)
+
+
+def _generate_with_model_fallback(raw_key: str, requested_model: str, payload: dict, timeout: int = 20):
+    """POST generateContent, automatically retrying with older models on 404
+    (model not available for this key/project). Returns (response, model_used)."""
+    res = _post_generate_content(raw_key, requested_model, payload, timeout)
+    if res.status_code != 404:
+        return res, requested_model
+
+    for fallback_model in MODEL_FALLBACK_CHAIN.get(requested_model, []):
+        res = _post_generate_content(raw_key, fallback_model, payload, timeout)
+        if res.status_code != 404:
+            return res, fallback_model
+
+    return res, requested_model
+
+
 def parse_gemini_transcript(raw_text: str) -> List[Dict[str, Any]]:
     """Parse Gemini's `[HH:MM:SS.mmm --> HH:MM:SS.mmm] text` transcript lines into segments."""
     pattern = re.compile(
@@ -156,36 +188,52 @@ def clean_khmer_translation(raw_text: str) -> str:
     text = re.sub(r'^[/:,\-\s\.]+', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
 
+    # If nothing but stray punctuation survived the stripping (e.g. the model's line
+    # was an English refusal/note like "(no dialogue)" and step 5 ate the words,
+    # leaving just ")"), this isn't a usable translation — signal failure instead of
+    # silently saving garbage into the subtitle.
+    if not re.search(r'[ក-៿]', text):
+        return ""
+
     return text
 
 
 from ..database.sqlite import DatabaseManager
 from ..utils.crypto import decrypt_api_key
 
-def test_gemini_key(raw_api_key: str, model_name: str = "gemini-2.5-flash") -> tuple[bool, str, int]:
-    """Tests a single Gemini API key and measures response time in ms."""
+def test_gemini_key(raw_api_key: str, model_name: str = "gemini-2.5-flash") -> tuple[bool, str, int, str]:
+    """Tests a single Gemini API key and measures response time in ms.
+    Returns (success, status, elapsed_ms, detail) — `detail` carries the actual
+    HTTP status/response so a real cause (bad key vs. quota vs. model not
+    available on this key/project vs. network error) doesn't get flattened
+    into a single misleading "Invalid" label."""
     if not raw_api_key:
-        return False, "Invalid", 0
+        return False, "Invalid", 0, "No API key provided."
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={raw_api_key}"
-    headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [{"role": "user", "parts": [{"text": "Ping"}]}],
         "generationConfig": {"maxOutputTokens": 5}
     }
     start_t = time.time()
     try:
-        res = requests.post(url, headers=headers, json=payload, timeout=10)
+        res, model_used = _generate_with_model_fallback(raw_api_key, model_name, payload, timeout=10)
         elapsed_ms = int((time.time() - start_t) * 1000)
+        fallback_note = "" if model_used == model_name else f" (auto-fell back to {model_used} — {model_name} isn't enabled for this key's project yet)"
         if res.status_code == 200:
-            return True, "Working", elapsed_ms
-        elif res.status_code in (429, 403):
-            return False, "Quota Exceeded", elapsed_ms
+            return True, "Working", elapsed_ms, f"OK{fallback_note}"
+        elif res.status_code == 429:
+            return False, "Quota Exceeded", elapsed_ms, f"429 Rate/Quota Limit: {res.text[:300]}"
+        elif res.status_code == 403:
+            return False, "Quota Exceeded", elapsed_ms, f"403 Forbidden (quota, billing, or API not enabled for this project): {res.text[:300]}"
+        elif res.status_code == 404:
+            return False, "Model Unavailable", elapsed_ms, f"404 — none of '{model_name}' or its fallback models are available for this key's project: {res.text[:300]}"
+        elif res.status_code == 400:
+            return False, "Invalid", elapsed_ms, f"400 Bad Request (often API_KEY_INVALID — check for extra spaces/newlines when pasting): {res.text[:300]}"
         else:
-            return False, "Invalid", elapsed_ms
-    except Exception:
+            return False, "Invalid", elapsed_ms, f"{res.status_code}: {res.text[:300]}"
+    except Exception as e:
         elapsed_ms = int((time.time() - start_t) * 1000)
-        return False, "Invalid", elapsed_ms
+        return False, "Invalid", elapsed_ms, f"Network/exception error: {str(e)}"
 
 
 class GeminiProvider(BaseAIProvider):
@@ -227,6 +275,10 @@ class GeminiProvider(BaseAIProvider):
             return self.fallback_provider.translate(text, source_lang, target_lang)
 
         cleaned_khmer = clean_khmer_translation(raw_translation)
+        if not cleaned_khmer:
+            # The model's line had no real Khmer left after cleanup (refusal, note-only
+            # reply, etc.) — fall back instead of saving stray punctuation as the subtitle.
+            return self.fallback_provider.translate(text, source_lang, target_lang)
 
         # Phase 2: Senior Khmer Screenplay Writer Polish Pass (AI Quality Review)
         if cleaned_khmer and len(cleaned_khmer) > 2:
@@ -304,7 +356,6 @@ class GeminiProvider(BaseAIProvider):
                 if language:
                     prompt += f"\nThe spoken language is: {language}."
 
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={raw_key}"
                 payload = {
                     "contents": [{
                         "role": "user",
@@ -315,7 +366,7 @@ class GeminiProvider(BaseAIProvider):
                     }],
                     "generationConfig": {"temperature": 0.1, "maxOutputTokens": 65536}
                 }
-                res = requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=600)
+                res, _model_used = _generate_with_model_fallback(raw_key, self.model_name, payload, timeout=600)
 
                 if res.status_code == 200:
                     data = res.json()
@@ -452,8 +503,6 @@ class GeminiProvider(BaseAIProvider):
             if not raw_key:
                 continue
 
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={raw_key}"
-            headers = {"Content-Type": "application/json"}
             payload = {
                 "contents": [
                     {
@@ -469,7 +518,7 @@ class GeminiProvider(BaseAIProvider):
 
             start_t = time.time()
             try:
-                res = requests.post(url, headers=headers, json=payload, timeout=20)
+                res, _model_used = _generate_with_model_fallback(raw_key, self.model_name, payload, timeout=20)
                 elapsed_ms = int((time.time() - start_t) * 1000)
 
                 if res.status_code == 200:

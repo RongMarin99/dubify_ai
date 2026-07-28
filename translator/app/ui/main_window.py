@@ -24,6 +24,7 @@ from ..core.whisper import WhisperWorker
 from ..core.gemini_stt import GeminiSTTWorker
 from ..core.translator import TranslationWorker
 from ..core.tts import TTSWorker
+from ..core.khmer_qa import KhmerAudioQAWorker
 from ..core.exporter import ExportManager
 from ..model.models import SubtitleItem, ProjectModel
 
@@ -245,7 +246,7 @@ class VideoPlayerWidget(QFrame):
         self.btn_add_blur.setChecked(enabled)
         if enabled:
             self.btn_add_blur.setText("✓ Blur On")
-            self.btn_add_blur.setStyleSheet("background-color: #6c5ce7; color: #ffffff; font-weight: bold; border-radius: 4px; padding: 5px 12px; border: 1px solid #a29bfe;")
+            self.btn_add_blur.setStyleSheet("background-color: #32a86b; color: #ffffff; font-weight: bold; border-radius: 4px; padding: 5px 12px; border: 1px solid #8ecfae;")
         else:
             self.btn_add_blur.setText("🌫️ Add Blur")
             self.btn_add_blur.setStyleSheet("")
@@ -541,6 +542,7 @@ class MainWindow(QMainWindow):
         self.timeline_widget.generate_transcript_clicked.connect(self._start_transcription)
         self.timeline_widget.translate_clicked.connect(self._start_translation)
         self.timeline_widget.generate_audio_clicked.connect(self._start_tts)
+        self.timeline_widget.verify_audio_clicked.connect(self._start_khmer_audio_qa)
 
         self.btn_import_srt.clicked.connect(self._import_srt)
         self.btn_export_srt.clicked.connect(self._export_srt)
@@ -559,7 +561,7 @@ class MainWindow(QMainWindow):
             stt_m = self.db.get_setting("gemini_stt_model_label", "Gemini 2.5 Flash")
         else:
             stt_m = self.db.get_setting("whisper_model", "Whisper Large v3")
-        trans_m = self.db.get_setting("ai_model", "Gemini 2.5 Flash")
+        trans_m = self.db.get_setting("ai_model_label", "Gemini 2.5 Pro")
         keys_count = len(self.db.get_gemini_keys(enabled_only=True))
         
         self.lbl_stt_badge.setText(f"🎙️ STT: {stt_m}")
@@ -755,7 +757,7 @@ class MainWindow(QMainWindow):
             subtitles=self.subtitles,
             engine_name=self.db.get_setting("ai_provider", "Gemini"),
             api_key=self.db.get_setting("gemini_api_key", ""),
-            model_name=self.db.get_setting("ai_model", "gemini-2.5-flash"),
+            model_name=self.db.get_setting("ai_model", "gemini-2.5-pro"),
             custom_prompt=self.db.get_setting("system_prompt", ""),
             cache_mgr=self.cache_mgr,
             db=self.db,
@@ -800,6 +802,51 @@ class MainWindow(QMainWindow):
         self.subtitle_editor.load_subtitles(self.subtitles)
         self.timeline_widget.load_subtitles(self.subtitles)
         self.video_player.set_subtitles(self.subtitles)
+
+    def _start_khmer_audio_qa(self):
+        if not self.subtitles:
+            QMessageBox.warning(self, "Warning", "No subtitles loaded to verify.")
+            return
+        if not any(s.audio_path for s in self.subtitles):
+            QMessageBox.warning(self, "Warning", "No generated audio found — run Generate Audio first.")
+            return
+
+        self.progress_bar.show()
+        self.timeline_widget.set_verifying(True)
+        self.status_bar.showMessage("Verifying Khmer dubbing audio against subtitle text...")
+
+        self.khmer_qa_worker = KhmerAudioQAWorker(self.subtitles)
+        self.khmer_qa_worker.progress.connect(self._update_progress)
+        self.khmer_qa_worker.item_checked.connect(self._on_khmer_qa_item_checked)
+        self.khmer_qa_worker.finished.connect(self._on_khmer_qa_finished)
+        self.khmer_qa_worker.failed.connect(self._on_khmer_qa_failed)
+        self.khmer_qa_worker.start()
+
+    def _on_khmer_qa_item_checked(self, sub_id: int, transcribed: str, similarity: float, flagged: bool):
+        for s in self.subtitles:
+            if s.id == sub_id:
+                s.confidence = similarity
+                if flagged:
+                    s.status = "Needs Review"
+                break
+
+    def _on_khmer_qa_finished(self, flagged_ids: list):
+        self.progress_bar.hide()
+        self.timeline_widget.set_verifying(False)
+        if flagged_ids:
+            self.status_bar.showMessage(f"Voice verification done — {len(flagged_ids)} line(s) flagged as 'Needs Review'.")
+            QMessageBox.warning(self, "Voice Verification",
+                f"{len(flagged_ids)} line(s) don't match their generated audio well — "
+                f"marked 'Needs Review' in the subtitle table. Consider regenerating those lines.")
+        else:
+            self.status_bar.showMessage("Voice verification done — all lines matched their audio.")
+        self.subtitle_editor.load_subtitles(self.subtitles)
+        self.timeline_widget.load_subtitles(self.subtitles)
+
+    def _on_khmer_qa_failed(self, err_msg: str):
+        self.progress_bar.hide()
+        self.timeline_widget.set_verifying(False)
+        self._on_worker_failed(err_msg)
 
     def _on_worker_failed(self, err_msg: str):
         self.progress_bar.hide()

@@ -82,7 +82,7 @@ class TimelineCanvas(QWidget):
 
         # Draw Lane Labels
         painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        painter.setPen(QColor("#a29bfe"))
+        painter.setPen(QColor("#8ecfae"))
         painter.drawText(10, y_text + 20, "TEXT")
         painter.drawText(10, y_audio + 20, "AUDIO")
         painter.drawText(10, y_bgm + 20, "BGM")
@@ -115,8 +115,8 @@ class TimelineCanvas(QWidget):
 
             # Subtitle Text Block
             sub_rect = QRectF(x1, y_text + 3, w, track_h - 6)
-            painter.fillRect(sub_rect, QColor(108, 92, 231, 160))
-            painter.setPen(QPen(QColor("#a29bfe"), 1))
+            painter.fillRect(sub_rect, QColor(50, 168, 107, 160))
+            painter.setPen(QPen(QColor("#8ecfae"), 1))
             painter.drawRoundedRect(sub_rect, 3, 3)
 
             # Draw label inside block
@@ -155,6 +155,7 @@ class TimelineWidget(QWidget):
     generate_transcript_clicked = Signal()  # engine/model now comes from Settings
     translate_clicked = Signal()
     generate_audio_clicked = Signal()
+    verify_audio_clicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -169,7 +170,7 @@ class TimelineWidget(QWidget):
         tb_layout = QHBoxLayout()
 
         self.lbl_title = QLabel("Timeline Editor")
-        self.lbl_title.setStyleSheet("font-weight: bold; color: #a29bfe;")
+        self.lbl_title.setStyleSheet("font-weight: bold; color: #8ecfae;")
 
         self.lbl_timecode = QLabel("00:00 / 00:00")
         self.lbl_timecode.setStyleSheet("color: #dcdde1; font-family: monospace;")
@@ -196,6 +197,13 @@ class TimelineWidget(QWidget):
 
         self.btn_audio = QPushButton("Generate Audio")
 
+        self.btn_verify_audio = QPushButton("🔍 Verify Voice")
+        self.btn_verify_audio.setToolTip(
+            "Re-transcribes each generated Khmer clip (sengtha/whisper-base-khmer) and "
+            "flags lines where the audio doesn't match the intended text — catches "
+            "mispronounced or garbled TTS before export."
+        )
+
         self.lbl_zoom = QLabel("Zoom")
         self.slider_zoom = QSlider(Qt.Horizontal)
         self.slider_zoom.setRange(10, 100)
@@ -213,6 +221,7 @@ class TimelineWidget(QWidget):
         tb_layout.addWidget(self.btn_translate)
         tb_layout.addWidget(self.combo_lead_offset)
         tb_layout.addWidget(self.btn_audio)
+        tb_layout.addWidget(self.btn_verify_audio)
         tb_layout.addStretch()
         tb_layout.addWidget(self.lbl_zoom)
         tb_layout.addWidget(self.slider_zoom)
@@ -228,6 +237,7 @@ class TimelineWidget(QWidget):
         self.btn_gen_transcript.clicked.connect(self.generate_transcript_clicked.emit)
         self.btn_translate.clicked.connect(self.translate_clicked)
         self.btn_audio.clicked.connect(self.generate_audio_clicked)
+        self.btn_verify_audio.clicked.connect(self.verify_audio_clicked)
         self.slider_zoom.valueChanged.connect(self.canvas.set_zoom)
         self.btn_fit.clicked.connect(lambda: self.slider_zoom.setValue(50))
         self.canvas.seek_requested.connect(self.seek_requested)
@@ -242,6 +252,14 @@ class TimelineWidget(QWidget):
         else:
             self.btn_gen_transcript.setEnabled(True)
             self.btn_gen_transcript.setText("🎙️ Generate Transcript")
+
+    def set_verifying(self, active: bool, status: str = ""):
+        if active:
+            self.btn_verify_audio.setEnabled(False)
+            self.btn_verify_audio.setText(f"⏳ {status or 'Verifying...'}")
+        else:
+            self.btn_verify_audio.setEnabled(True)
+            self.btn_verify_audio.setText("🔍 Verify Voice")
 
     def update_playhead(self, time_ms: int, duration_ms: int):
         self.canvas.set_duration(duration_ms)

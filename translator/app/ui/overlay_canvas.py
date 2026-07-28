@@ -374,11 +374,11 @@ class VideoOverlayCanvas(QWidget):
             card_rect = QRectF(cx, cy, cw, ch)
 
             painter.fillRect(card_rect, QColor("#1c1a33"))
-            painter.setPen(QPen(QColor("#6c5ce7"), 2, Qt.DashLine))
+            painter.setPen(QPen(QColor("#32a86b"), 2, Qt.DashLine))
             painter.drawRoundedRect(card_rect, 10, 10)
 
             painter.setFont(QFont("Segoe UI", 28))
-            painter.setPen(QColor("#a29bfe"))
+            painter.setPen(QColor("#8ecfae"))
             painter.drawText(QRectF(cx, cy + 15, cw, 45), Qt.AlignCenter, "📁")
 
             painter.setFont(QFont("Segoe UI", 12, QFont.Bold))
@@ -432,7 +432,7 @@ class VideoOverlayCanvas(QWidget):
                               QPointF(blur_rect.right() - self.corner_radius, blur_rect.top() + 1))
 
             # Selection border (editing-mode indicator only, not baked into export)
-            border_color = QColor("#8B5CF6") if getattr(self, '_hover_blur', False) else QColor("#7C4DFF")
+            border_color = QColor("#4bb27d") if getattr(self, '_hover_blur', False) else QColor("#32a86b")
             painter.setPen(QPen(border_color, 2, Qt.SolidLine))
             painter.drawPath(path)
 
@@ -466,16 +466,16 @@ class VideoOverlayCanvas(QWidget):
             painter.setPen(handle_pen)
             painter.drawRect(br_box)
 
-            # Move Handle (🤚) Top Center Left (#7C4DFF)
+            # Move Handle (🤚) Top Center Left (#32a86b)
             mv_rect = QRectF(bx + bw / 2.0 - 24, by - 22, 20, 20)
-            painter.fillRect(mv_rect, QColor("#7C4DFF"))
+            painter.fillRect(mv_rect, QColor("#32a86b"))
             painter.setPen(QColor("#FFFFFF"))
             painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
             painter.drawText(mv_rect, Qt.AlignCenter, "🤚")
 
-            # Color & Transparency Handle (🎨) Top Center Right (#9C6EFF)
+            # Color & Transparency Handle (🎨) Top Center Right (#5fbb8c)
             col_rect = QRectF(bx + bw / 2.0 + 2, by - 22, 20, 20)
-            painter.fillRect(col_rect, QColor("#9C6EFF"))
+            painter.fillRect(col_rect, QColor("#5fbb8c"))
             painter.setPen(QColor("#FFFFFF"))
             painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
             painter.drawText(col_rect, Qt.AlignCenter, "🎨")
@@ -496,11 +496,11 @@ class VideoOverlayCanvas(QWidget):
             logo_rect = QRectF(lx, ly, lw, lh)
 
             painter.drawPixmap(logo_rect.toRect(), self.logo_pixmap)
-            painter.setPen(QPen(QColor("#6c5ce7"), 1.5, Qt.DashLine))
+            painter.setPen(QPen(QColor("#32a86b"), 1.5, Qt.DashLine))
             painter.drawRect(logo_rect)
 
             handle_rect = QRectF(lx + lw - 12, ly + lh - 12, 12, 12)
-            painter.fillRect(handle_rect, QColor("#6c5ce7"))
+            painter.fillRect(handle_rect, QColor("#32a86b"))
 
         # 3. Render Real-Time Subtitle Overlay Object
         if self.is_sub_visible and self.sub_text:

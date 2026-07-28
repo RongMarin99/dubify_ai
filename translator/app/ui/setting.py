@@ -19,7 +19,7 @@ from ..utils.crypto import decrypt_api_key, mask_api_key
 
 
 class KeyTesterThread(QThread):
-    result = Signal(int, bool, str, int)  # key_id, success, status, latency_ms
+    result = Signal(int, bool, str, int, str)  # key_id, success, status, latency_ms, detail
 
     def __init__(self, key_id: int, raw_key: str, model_name: str = "gemini-2.5-flash"):
         super().__init__()
@@ -28,8 +28,8 @@ class KeyTesterThread(QThread):
         self.model_name = model_name
 
     def run(self):
-        success, status, latency = test_gemini_key(self.raw_key, self.model_name)
-        self.result.emit(self.key_id, success, status, latency)
+        success, status, latency, detail = test_gemini_key(self.raw_key, self.model_name)
+        self.result.emit(self.key_id, success, status, latency, detail)
 
 
 class LocalModelDetectorThread(QThread):
@@ -543,6 +543,21 @@ class SettingsDialog(QDialog):
         self.grp_stt_opts.setVisible(not is_gemini)
 
     @staticmethod
+    def _translation_model_id(label: str) -> str:
+        """Map a Translation-tab combo label to the real API model id it needs."""
+        if "Gemini 2.5 Pro" in label:
+            return "gemini-2.5-pro"
+        elif "Gemini 2.5 Flash" in label:
+            return "gemini-2.5-flash"
+        elif "GPT-4o" in label:
+            return "gpt-4o"
+        elif "DeepSeek" in label:
+            return "deepseek-chat"
+        elif "Llama-3" in label:
+            return "llama3"
+        return label
+
+    @staticmethod
     def _stt_size_keyword(label: str) -> str:
         """Map a combo label ("Whisper Medium — Recommended") to the faster-whisper
         size keyword it actually needs ("medium")."""
@@ -598,14 +613,24 @@ class SettingsDialog(QDialog):
         r1.addWidget(QLabel("Select Engine / Model:"))
         self.combo_trans_engine = QComboBox()
         self.combo_trans_engine.addItems([
-            "Gemini 2.5 Flash (Recommended)",
-            "Gemini 2.5 Pro",
+            "Gemini 2.5 Pro (Recommended — Most Natural Khmer)",
+            "Gemini 2.5 Flash (Faster, Slightly Less Natural)",
             "OpenAI GPT-4o",
             "DeepSeek R1 / V3",
             "Ollama Local Llama-3"
         ])
         r1.addWidget(self.combo_trans_engine, 1)
         tl.addLayout(r1)
+
+        trans_note = QLabel(
+            "Pro gives more natural, idiomatic Khmer dubbing dialogue — worth the extra "
+            "latency for a translate-once workflow. Every model still runs the same 2-pass "
+            "pipeline (context-aware translate, then a dedicated Khmer-naturalization polish "
+            "pass) regardless of which one you pick."
+        )
+        trans_note.setWordWrap(True)
+        trans_note.setStyleSheet("color: #8c89b4; font-size: 11px;")
+        tl.addWidget(trans_note)
 
         layout.addWidget(grp_trans)
 
@@ -790,7 +815,7 @@ class SettingsDialog(QDialog):
             btn_test = QPushButton("⚡ Test")
             btn_test.setFixedWidth(54)
             btn_test.setStyleSheet("font-size: 11px; padding: 3px 6px;")
-            btn_test.clicked.connect(lambda _, kid=key_id, rk=raw_k: self._test_single_key(kid, rk))
+            btn_test.clicked.connect(lambda _, kid=key_id, rk=raw_k: self._test_single_key(kid, rk, show_detail=True))
 
             btn_toggle = QPushButton("Disable" if enabled else "Enable")
             btn_toggle.setFixedWidth(62)
@@ -857,9 +882,12 @@ class SettingsDialog(QDialog):
             self.db.delete_gemini_key(key_id)
             self._refresh_keys_table()
 
-    def _test_single_key(self, key_id: int, raw_key: str):
+    def _test_single_key(self, key_id: int, raw_key: str, show_detail: bool = False):
         tester = KeyTesterThread(key_id, raw_key)
-        tester.result.connect(self._on_key_test_result)
+        if show_detail:
+            tester.result.connect(self._on_key_test_result_verbose)
+        else:
+            tester.result.connect(self._on_key_test_result)
         self.tester_threads.append(tester)
         tester.start()
 
@@ -869,9 +897,16 @@ class SettingsDialog(QDialog):
             raw_k = decrypt_api_key(k["api_key_encrypted"])
             self._test_single_key(k["id"], raw_k)
 
-    def _on_key_test_result(self, key_id: int, success: bool, status: str, latency_ms: int):
+    def _on_key_test_result(self, key_id: int, success: bool, status: str, latency_ms: int, detail: str):
         self.db.update_gemini_key_stats(key_id, status=status, response_time_ms=latency_ms)
         self._refresh_keys_table()
+
+    def _on_key_test_result_verbose(self, key_id: int, success: bool, status: str, latency_ms: int, detail: str):
+        self._on_key_test_result(key_id, success, status, latency_ms, detail)
+        if success:
+            QMessageBox.information(self, "Key Test", f"✅ Working ({latency_ms}ms)")
+        else:
+            QMessageBox.warning(self, "Key Test Failed", f"Status: {status}\n\n{detail}")
 
     # ----------------------------------------------------
     # SECTION 4: Local Models
@@ -1061,8 +1096,8 @@ class SettingsDialog(QDialog):
         self.chk_vad.setChecked(self.db.get_setting("enable_vad", "true") == "true")
 
         # Translation
-        trans_model = self.db.get_setting("ai_model", "Gemini 2.5 Flash")
-        idx = self.combo_trans_engine.findText(trans_model)
+        trans_label = self.db.get_setting("ai_model_label", "Gemini 2.5 Pro (Recommended — Most Natural Khmer)")
+        idx = self.combo_trans_engine.findText(trans_label)
         if idx != -1:
             self.combo_trans_engine.setCurrentIndex(idx)
 
@@ -1105,9 +1140,13 @@ class SettingsDialog(QDialog):
         self.db.set_setting("custom_stt_language", self.edit_custom_lang.text().strip())
         self.db.set_setting("enable_vad", "true" if self.chk_vad.isChecked() else "false")
 
-        # Translation
+        # Translation — store the real API model id separately from the display label.
+        # (Previously the full label text like "Gemini 2.5 Flash (Recommended)" was saved
+        # as "ai_model" and sent straight to the API as the model id — always a 404 once
+        # this page was ever saved. TranslationWorker/GeminiProvider now expect a clean id.)
         selected_trans = self.combo_trans_engine.currentText()
-        self.db.set_setting("ai_model", selected_trans)
+        self.db.set_setting("ai_model_label", selected_trans)
+        self.db.set_setting("ai_model", self._translation_model_id(selected_trans))
         if "Gemini" in selected_trans:
             self.db.set_setting("ai_provider", "Gemini")
         elif "OpenAI" in selected_trans or "GPT" in selected_trans:

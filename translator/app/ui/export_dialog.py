@@ -54,7 +54,7 @@ class ExportSettingsDialog(QDialog):
 
         # Title Label
         lbl_title = QLabel("🎬 Export Video Settings")
-        lbl_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #a29bfe;")
+        lbl_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #8ecfae;")
         layout.addWidget(lbl_title)
 
         # File & Location Group
@@ -161,7 +161,7 @@ class ExportSettingsDialog(QDialog):
 
         self.btn_render = QPushButton("🎬 Start Render")
         self.btn_render.setObjectName("PrimaryBtn")
-        self.btn_render.setStyleSheet("background-color: #6c5ce7; color: white; font-weight: bold; padding: 8px 20px;")
+        self.btn_render.setStyleSheet("background-color: #32a86b; color: white; font-weight: bold; padding: 8px 20px;")
         self.btn_render.clicked.connect(self.accept)
 
         btn_box.addStretch()
@@ -220,7 +220,7 @@ class RenderProgressDialog(QDialog):
         layout.setSpacing(12)
 
         self.lbl_title = QLabel("🎬 Rendering Video...")
-        self.lbl_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #a29bfe;")
+        self.lbl_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #8ecfae;")
         layout.addWidget(self.lbl_title)
 
         self.lbl_step = QLabel("Preparing project & audio tracks...")
@@ -230,7 +230,7 @@ class RenderProgressDialog(QDialog):
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(5)
-        self.progress_bar.setStyleSheet("QProgressBar::chunk { background-color: #6c5ce7; }")
+        self.progress_bar.setStyleSheet("QProgressBar::chunk { background-color: #32a86b; }")
         layout.addWidget(self.progress_bar)
 
         # Stats Label
