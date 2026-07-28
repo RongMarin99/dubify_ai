@@ -16,9 +16,10 @@ class ExportManager:
         subtitles: List[SubtitleItem],
         output_path: str,
         use_target: bool = True,
-        style_config: Optional[Dict[str, Any]] = None
+        style_config: Optional[Dict[str, Any]] = None,
+        aspect_ratio: str = "Original"
     ):
-        SubtitleParser.export_ass(subtitles, output_path, use_target=use_target, style_config=style_config)
+        SubtitleParser.export_ass(subtitles, output_path, use_target=use_target, style_config=style_config, aspect_ratio=aspect_ratio)
 
     def export_video(
         self,
@@ -36,18 +37,33 @@ class ExportManager:
     ) -> bool:
         os.makedirs(temp_dir, exist_ok=True)
 
-        # 1. Export Subtitle ASS
-        temp_sub_path = os.path.join(temp_dir, "export_sub.ass")
-        self.export_ass(subtitles, temp_sub_path, use_target=True, style_config=style_config)
+        # 1. Determine Target Dimensions for Subtitle PNG rendering
+        # Match FFmpeg target dimensions logic based on aspect ratio mode
+        if "9:16" in aspect_ratio:
+            target_w, target_h = 1080, 1920
+        elif "16:9" in aspect_ratio:
+            target_w, target_h = 1920, 1080
+        elif "1:1" in aspect_ratio:
+            target_w, target_h = 1080, 1080
+        elif "4:5" in aspect_ratio:
+            target_w, target_h = 1080, 1350
+        else:
+            target_w, target_h = self.ffmpeg_mgr.get_video_dimensions(video_path)
+            
+        # 2. Render pixel-perfect transparent PNG subtitles sequence via Qt QPainter
+        # to guarantee 100% synchronization with the UI preview layout.
+        from .subtitle_renderer import SubtitleRenderer
+        renderer = SubtitleRenderer(style_config, aspect_ratio, target_w, target_h)
+        concat_path = renderer.generate_concat_video(subtitles, os.path.join(temp_dir, "subs_frames"))
 
-        # 2. Merge generated TTS audio clips into full dubbed audio track (with lead time offset)
+        # 3. Merge generated TTS audio clips into full dubbed audio track
         temp_dubbed_audio = os.path.join(temp_dir, "merged_dubbed_track.wav")
         has_dubbed_track = self.ffmpeg_mgr.merge_tts_audio_tracks(subtitles, temp_dubbed_audio, audio_offset_ms=audio_offset_ms)
 
-        # 3. Export Video with burned subtitles, logo, blur mask, aspect ratio, speech-gated ducking, and dubbed audio
+        # 4. Export Video with burned subtitles, logo, blur mask, aspect ratio, speech-gated ducking, and dubbed audio
         return self.ffmpeg_mgr.export_video_with_subtitles(
             video_path=video_path,
-            subtitle_path=temp_sub_path,
+            subtitle_concat_path=concat_path,
             output_video_path=output_video_path,
             dubbed_audio_path=temp_dubbed_audio if has_dubbed_track else None,
             mute_original_audio=mute_original_audio,

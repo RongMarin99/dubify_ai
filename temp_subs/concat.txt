@@ -1,0 +1,10 @@
+ffconcat version 1.0
+file 'blank.png'
+duration 1.0
+file 'sub_1.png'
+duration 2.0
+file 'blank.png'
+duration 1.0
+file 'sub_2.png'
+duration 1.0
+file 'blank.png'

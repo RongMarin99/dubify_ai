@@ -135,6 +135,7 @@ I'm sorry -> ខ្ញុំសុំទោស
 
 STRICT OUTPUT RULES:
 - Return ONLY the final clean Khmer subtitle.
+- NEVER use period '.' or Khmer full stop '។' (Khan) at the end or inside subtitles. Omit period '.' and '។' completely.
 - No explanation, no English, no Chinese, no parentheses, no markdown.
 """
 
@@ -160,7 +161,8 @@ Requirements:
 12. Maximum two subtitle lines.
 13. Do not add or remove important information.
 14. If the sentence already sounds natural, return it unchanged.
-15. Return ONLY the improved Khmer subtitle.
+15. NEVER use period '.' or Khmer full stop '។' (Khan). Remove all '.' and '។' from Khmer subtitles to keep captions clean.
+16. Return ONLY the improved Khmer subtitle.
 
 Example:
 
@@ -168,23 +170,23 @@ Original:
 ខ្ញុំមិនអាចទទួលយករឿងនេះបានទេ។
 
 Improved:
-ខ្ញុំមិនអាចទទួលយកបានទេ!
+ខ្ញុំមិនអាចទទួលយកបានទេ
 
 Original:
 អ្នកកំពុងនិយាយអ្វី?
 
 Improved:
-ឯងកំពុងនិយាយអីហ្នឹង?
+ឯងកំពុងនិយាយអីហ្នឹង
 
 Original:
 សូមអរគុណចំពោះការជួយរបស់អ្នក។
 
 Improved:
-អរគុណដែលជួយខ្ញុំ។
+អរគុណដែលជួយខ្ញុំ
 """
 
 def clean_khmer_translation(raw_text: str) -> str:
-    """Post-processor to extract pure Khmer script from LLM output, removing any English notes or markdown."""
+    """Post-processor to extract pure Khmer script from LLM output, removing any English notes, markdown, or messy dots/khan."""
     if not raw_text:
         return ""
 
@@ -214,8 +216,10 @@ def clean_khmer_translation(raw_text: str) -> str:
     # 5. Remove any leftover English words or romanizations
     text = re.sub(r'\b[A-Za-z0-9_]{2,}\b', '', text)
 
-    # 6. Clean leading/trailing punctuation and extra whitespace
-    text = re.sub(r'^[/:,\-\s\.]+', '', text)
+    # 6. Clean leading/trailing punctuation, messy period (.) and Khmer full stop (។)
+    text = text.replace("។", "").replace(".", "")
+    text = re.sub(r'^[/:,\-\s]+', '', text)
+    text = re.sub(r'[/:\-\s]+$', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
 
     # If nothing but stray punctuation survived the stripping (e.g. the model's line

@@ -266,6 +266,13 @@ class SubtitleEditorWidget(QWidget):
         elif col == 2:  # Chinese
             item.src_text = val
         elif col == 3:  # Khmer
+            if val and re.search(r'[\u1780-\u17FF]', val):
+                cleaned_val = val.replace("។", "").replace(".", "").strip()
+                if cleaned_val != val:
+                    val = cleaned_val
+                    self.table.blockSignals(True)
+                    cell_item.setText(val)
+                    self.table.blockSignals(False)
             item.tgt_text = val
         elif col == 4:  # Voice
             item.voice = val
