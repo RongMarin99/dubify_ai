@@ -1,0 +1,15 @@
+[Script Info]
+Title: Dubify Studio Professional Subtitles
+ScriptType: v4.00+
+WrapStyle: 0
+PlayResX: 1080
+PlayResY: 1920
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Khmer OS Battambang,64,&H00FFFFFF,&H000000FF,&H00000000,&H001B1012,1,0,0,0,100,100,0,0,1,5,2,2,40,40,288,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,00:00:00.0,00:00:05.0,Default,,0,0,0,,សួស្ដី ពិភពលោក

@@ -146,7 +146,8 @@ class FFmpegManager:
             cmd.extend(["-filter_complex", filter_parts[0], "-map", "[a0]", output_audio_path])
         else:
             mix_str = "".join(mix_inputs)
-            filter_parts.append(f"{mix_str}amix=inputs={len(valid_subs)}:duration=longest:dropout_transition=0[aout]")
+            # Use normalize=0 so volume is NOT attenuated by number of inputs
+            filter_parts.append(f"{mix_str}amix=inputs={len(valid_subs)}:duration=longest:dropout_transition=0:normalize=0[aout]")
             cmd.extend(["-filter_complex", ";".join(filter_parts), "-map", "[aout]", output_audio_path])
 
         try:
@@ -219,7 +220,7 @@ class FFmpegManager:
     def export_video_with_subtitles(
         self,
         video_path: str,
-        subtitle_path: str,
+        subtitle_concat_path: str,
         output_video_path: str,
         dubbed_audio_path: Optional[str] = None,
         mute_original_audio: bool = True,
@@ -229,9 +230,14 @@ class FFmpegManager:
         aspect_ratio: str = "Original",
         orig_audio_vol_pct: int = 20
     ) -> bool:
-        """Burn subtitles, logo overlay, blur mask, aspect ratio, and dynamic original audio volume into output video."""
-        cmd = [self.ffmpeg_path, "-y", "-i", video_path]
-        next_input_idx = 1
+        """Burn subtitles (via concat image sequence), logo overlay, blur mask, aspect ratio, and dynamic original audio volume into output video."""
+        cmd = [self.ffmpeg_path, "-y"]
+        next_input_idx = 0
+        
+        # Input 0: Video
+        cmd.extend(["-i", video_path])
+        video_input_idx = next_input_idx
+        next_input_idx += 1
 
         # Check logo input file
         logo_path = (logo_config or {}).get("path", "")
@@ -250,99 +256,151 @@ class FFmpegManager:
             dubbed_input_idx = next_input_idx
             next_input_idx += 1
 
-        # Relative or escaped subtitle path for libass subtitles filter
-        # Format as filename='...' to prevent FFmpeg from mistaking drive letter (C:, F:) for image size option
-        try:
-            sub_rel_path = os.path.relpath(subtitle_path, start=os.getcwd()).replace("\\", "/")
-        except Exception:
-            sub_rel_path = subtitle_path.replace("\\", "/")
+        # Subtitle image sequence input
+        subtitle_input_idx = -1
+        if subtitle_concat_path and os.path.exists(subtitle_concat_path):
+            cmd.extend(["-f", "concat", "-safe", "0", "-i", subtitle_concat_path])
+            subtitle_input_idx = next_input_idx
+            next_input_idx += 1
 
-        if ":" in sub_rel_path:
-            sub_clean = os.path.abspath(subtitle_path).replace("\\", "/")
-            sub_arg = f"filename='{sub_clean.replace(':', '\\:')}'"
+        # Determine target resolution according to aspect ratio
+        if "9:16" in aspect_ratio:
+            target_w, target_h = 1080, 1920
+        elif "16:9" in aspect_ratio:
+            target_w, target_h = 1920, 1080
+        elif "1:1" in aspect_ratio:
+            target_w, target_h = 1080, 1080
+        elif "4:5" in aspect_ratio:
+            target_w, target_h = 1080, 1350
         else:
-            sub_arg = f"filename='{sub_rel_path.replace(':', '\\:')}'"
+            target_w, target_h = self.get_video_dimensions(video_path)
+
+        # Original source video dimensions for inner image rect calculation
+        vw, vh = self.get_video_dimensions(video_path)
+        v_aspect = (vw / float(vh)) if vh > 0 else (16.0 / 9.0)
+        target_aspect = (target_w / float(target_h)) if target_h > 0 else (16.0 / 9.0)
+
+        if aspect_ratio == "Original" or abs(v_aspect - target_aspect) < 0.01:
+            inv_x, inv_y, inv_w, inv_h = 0, 0, target_w, target_h
+        elif target_aspect > v_aspect:
+            inv_h = target_h
+            inv_w = int(target_h * v_aspect)
+            inv_x = int((target_w - inv_w) / 2.0)
+            inv_y = 0
+        else:
+            inv_w = target_w
+            inv_h = int(target_w / v_aspect)
+            inv_x = 0
+            inv_y = int((target_h - inv_h) / 2.0)
 
         filter_complex_parts = []
         cur_v_label = "[0:v]"
 
-        # 1. Blur filter — frosted glass panel (Gaussian/BoxBlur backdrop + tint + rim highlight)
+        # STEP 1: Scale & Pad video to target aspect ratio FIRST so all subsequent filters (blur, logo, subtitles)
+        # map 1:1 onto target dimensions!
+        if aspect_ratio != "Original":
+            filter_complex_parts.append(
+                f"{cur_v_label}scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black[v_base]"
+            )
+            cur_v_label = "[v_base]"
+
+        # STEP 2: Blur filter — blur_config percentages are relative to the inner video image rect
+        # (the actual video content within letterbox/pillarbox bars), so we map them onto
+        # (inv_x, inv_y, inv_w, inv_h) within the target canvas.
         if blur_config and blur_config.get("enabled", False):
-            bx = blur_config.get("x", 0.10)
-            by = blur_config.get("y", 0.80)
-            bw = blur_config.get("w", 0.80)
-            bh = blur_config.get("h", 0.12)
+            bx = max(0.0, min(0.95, float(blur_config.get("x", 0.10))))
+            by = max(0.0, min(0.95, float(blur_config.get("y", 0.80))))
+            bw = max(0.05, min(1.0, float(blur_config.get("w", 0.80))))
+            bh = max(0.05, min(1.0, float(blur_config.get("h", 0.12))))
             blur_radius = max(1, int(blur_config.get("radius", 22)))
             tint_hex = str(blur_config.get("color", "#0f0f19")).lstrip("#")
             tint_opacity = max(0.0, min(1.0, float(blur_config.get("opacity", 0.85))))
             tint_ffmpeg = f"0x{tint_hex}@{tint_opacity:.2f}"
-            vw, vh = self.get_video_dimensions(video_path)
-            x_px = max(0, int(vw * bx))
-            y_px = max(0, int(vh * by))
-            w_px = max(1, min(vw - x_px, int(vw * bw)))
-            h_px = max(1, min(vh - y_px, int(vh * bh)))
-            # Crop region -> Gaussian/box blur backdrop -> translucent tint -> thin glass rim
-            # highlight along the top edge (matches the live editor preview) -> overlay back
+
+            # Map percentages onto inner video image rect, not full target canvas
+            x_px = inv_x + int(inv_w * bx)
+            y_px = inv_y + int(inv_h * by)
+            w_px = int(inv_w * bw)
+            h_px = int(inv_h * bh)
+
+            w_px = max(16, min(target_w - 4, w_px))
+            h_px = max(16, min(target_h - 4, h_px))
+
+            if x_px + w_px > target_w:
+                x_px = max(0, target_w - w_px)
+            if y_px + h_px > target_h:
+                y_px = max(0, target_h - h_px)
+
+            x_px = (x_px // 2) * 2
+            y_px = (y_px // 2) * 2
+            w_px = max(16, (w_px // 2) * 2)
+            h_px = max(16, (h_px // 2) * 2)
+
+            if x_px + w_px > target_w:
+                w_px = ((target_w - x_px) // 2) * 2
+            if y_px + h_px > target_h:
+                h_px = ((target_h - y_px) // 2) * 2
+
             filter_complex_parts.append(
-                f"{cur_v_label}crop={w_px}:{h_px}:{x_px}:{y_px},"
+                f"{cur_v_label}split[v_blur_main][v_blur_crop];"
+                f"[v_blur_crop]crop={w_px}:{h_px}:{x_px}:{y_px},"
                 f"boxblur=luma_radius={blur_radius}:luma_power=2:chroma_radius={blur_radius}:chroma_power=2,"
                 f"drawbox=x=0:y=0:w=iw:h=ih:color={tint_ffmpeg}:t=fill,"
                 f"drawbox=x=0:y=0:w=iw:h=2:color=white@0.25:t=fill[b_crop];"
-                f"{cur_v_label}[b_crop]overlay={x_px}:{y_px}[v_blur]"
+                f"[v_blur_main][b_crop]overlay={x_px}:{y_px}[v_blur]"
             )
             cur_v_label = "[v_blur]"
 
-        # 2. Logo overlay filter
+        # STEP 3: Logo overlay filter — logo coords are also relative to inner video image rect
         if has_logo and logo_input_idx != -1:
             lx = logo_config.get("x", 0.05)
             ly = logo_config.get("y", 0.05)
             lw = logo_config.get("w", 0.20)
             lh = logo_config.get("h", 0.12)
-            filter_complex_parts.append(f"[{logo_input_idx}:v]scale=eval=frame:w=main_w*{lw:.3f}:h=main_h*{lh:.3f}[logo_scaled]")
-            filter_complex_parts.append(f"{cur_v_label}[logo_scaled]overlay=x=main_w*{lx:.3f}:y=main_h*{ly:.3f}[v_logo]")
+            logo_x_px = inv_x + int(inv_w * lx)
+            logo_y_px = inv_y + int(inv_h * ly)
+            logo_w_px = max(16, int(inv_w * lw))
+            logo_h_px = max(16, int(inv_h * lh))
+            filter_complex_parts.append(f"[{logo_input_idx}:v]scale=eval=frame:w={logo_w_px}:h={logo_h_px}[logo_scaled]")
+            filter_complex_parts.append(f"{cur_v_label}[logo_scaled]overlay=x={logo_x_px}:y={logo_y_px}[v_logo]")
             cur_v_label = "[v_logo]"
 
-        # 3. Aspect Ratio Scale & Pad Filter
-        if aspect_ratio == "9:16 (Portrait)":
-            filter_complex_parts.append(f"{cur_v_label}scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black[v_aspect]")
-            cur_v_label = "[v_aspect]"
-        elif aspect_ratio == "16:9 (Landscape)":
-            filter_complex_parts.append(f"{cur_v_label}scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black[v_aspect]")
-            cur_v_label = "[v_aspect]"
-        elif aspect_ratio == "1:1 (Square)":
-            filter_complex_parts.append(f"{cur_v_label}scale=1080:1080:force_original_aspect_ratio=decrease,pad=1080:1080:(ow-iw)/2:(oh-ih)/2:black[v_aspect]")
-            cur_v_label = "[v_aspect]"
-        elif aspect_ratio == "4:5 (Vertical)":
-            filter_complex_parts.append(f"{cur_v_label}scale=1080:1350:force_original_aspect_ratio=decrease,pad=1080:1350:(ow-iw)/2:(oh-ih)/2:black[v_aspect]")
-            cur_v_label = "[v_aspect]"
-
-        # 4. Subtitles filter
-        filter_complex_parts.append(f"{cur_v_label}subtitles={sub_arg}[vout]")
-
-        # 5. Audio Filtering & Mixing (Boosted Dubbed TTS Speech + EBU R128 Loudness Normalization)
-        vol_factor = max(0.0, min(1.0, orig_audio_vol_pct / 100.0))
-        duck_exprs = []
-        if subtitles and mute_original_audio:
-            for s in subtitles:
-                if s.start_ms < s.end_ms:
-                    s_sec = s.start_ms / 1000.0
-                    e_sec = s.end_ms / 1000.0
-                    duck_exprs.append(f"between(t,{s_sec:.3f},{e_sec:.3f})")
-
-        if duck_exprs:
-            enable_cond = "+".join(duck_exprs)
-            vol_filter = f"aformat=sample_rates=44100:channel_layouts=stereo,volume='if({enable_cond},{vol_factor:.2f},1.0)':eval=frame"
+        # STEP 4: Subtitles filter (overlay the concat image sequence)
+        if subtitle_input_idx != -1:
+            filter_complex_parts.append(f"{cur_v_label}[{subtitle_input_idx}:v]overlay=x=0:y=0:shortest=0[vout]")
+            cur_v_label = "[vout]"
         else:
-            vol_filter = f"aformat=sample_rates=44100:channel_layouts=stereo,volume={vol_factor:.2f}" if mute_original_audio else "aformat=sample_rates=44100:channel_layouts=stereo,volume=1.0"
+            filter_complex_parts.append(f"{cur_v_label}copy[vout]")
+
+        # STEP 5: Audio Filtering & Mixing (Boosted Dubbed TTS Speech + Speech Ducking)
+        mute_all_audio = export_kwargs.get("mute_all_audio", False)
+        if mute_all_audio:
+            vol_filter = "aformat=sample_rates=44100:channel_layouts=stereo,volume=0.0"
+        else:
+            vol_factor = max(0.0, min(1.0, orig_audio_vol_pct / 100.0))
+            duck_exprs = []
+            if subtitles and mute_original_audio: # mute_original_audio is actually the Speech Ducking toggle
+                for s in subtitles:
+                    if s.start_ms < s.end_ms:
+                        s_sec = s.start_ms / 1000.0
+                        e_sec = s.end_ms / 1000.0
+                        duck_exprs.append(f"between(t,{s_sec:.3f},{e_sec:.3f})")
+
+            if duck_exprs:
+                enable_cond = "+".join(duck_exprs)
+                vol_filter = f"aformat=sample_rates=44100:channel_layouts=stereo,volume='if({enable_cond},{vol_factor:.2f},1.0)':eval=frame"
+            else:
+                vol_filter = f"aformat=sample_rates=44100:channel_layouts=stereo,volume={vol_factor:.2f}" if mute_original_audio else "aformat=sample_rates=44100:channel_layouts=stereo,volume=1.0"
 
         filter_complex_parts.append(f"[0:a]{vol_filter}[bg_a]")
 
         if has_dubbed and dubbed_input_idx != -1:
-            filter_complex_parts.append(f"[{dubbed_input_idx}:a]aformat=sample_rates=44100:channel_layouts=stereo,volume=2.0[dub_a]")
-            filter_complex_parts.append(f"[bg_a][dub_a]amix=inputs=2:weights='1 2.2':normalize=0:duration=first:dropout_transition=0[amix_raw]")
-            filter_complex_parts.append(f"[amix_raw]loudnorm=I=-14:TP=-1.0:LRA=11[aout]")
+            # Boost TTS voice track to volume 1.8 so dubbed speech is loud, clear, and prominent
+            filter_complex_parts.append(f"[{dubbed_input_idx}:a]aformat=sample_rates=44100:channel_layouts=stereo,volume=1.8[dub_a]")
+            filter_complex_parts.append(f"[bg_a][dub_a]amix=inputs=2:weights='1 2.5':normalize=0:duration=first:dropout_transition=0[aout]")
         else:
-            filter_complex_parts.append(f"[bg_a]loudnorm=I=-14:TP=-1.0:LRA=11[aout]")
+            filter_complex_parts.append(f"[bg_a]aformat=sample_rates=44100:channel_layouts=stereo[aout]")
 
         full_filter_complex = ";".join(filter_complex_parts)
 

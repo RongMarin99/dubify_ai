@@ -92,7 +92,7 @@ class VoxCPM2KhmerRunner:
             wav = self._model.generate(
                 text=f"{descriptor}{text}" if descriptor else text,
                 cfg_value=2.0,
-                inference_timesteps=10,
+                inference_timesteps=6,
             )
             sf.write(output_file, wav, self._model.tts_model.sample_rate)
             return os.path.exists(output_file) and os.path.getsize(output_file) > 0
@@ -184,6 +184,12 @@ class TTSWorker(QThread):
                     if "VoxCPM2" in self.engine:
                         runner = VoxCPM2KhmerRunner.get_instance()
                         success = runner.generate(text_to_speak, role_config, out_path)
+                        if not success:
+                            reason = runner._failure_reason or "No CUDA GPU / Model missing"
+                            self.progress.emit(
+                                int((idx) / total * 100),
+                                f"VoxCPM2 unavailable ({reason[:35]}) — Auto falling back to Edge-TTS..."
+                            )
 
                     # 2. Direct In-Process CosyVoice 2 PyTorch Model Synthesis
                     if not success and ("CosyVoice" in self.engine or "Voxc" in self.engine):

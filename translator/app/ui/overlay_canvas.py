@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Optional, List, Dict, Any
 from PySide6.QtWidgets import QWidget
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QTimer
@@ -9,6 +10,64 @@ from PySide6.QtGui import (
 )
 
 from ..model.models import SubtitleItem
+
+
+def wrap_text_to_pixel_width(text: str, metrics: QFontMetrics, max_px: float) -> List[str]:
+    """Break text into lines cleanly so no line exceeds max_px in font metrics.
+    Handles Khmer (non-spaced), Chinese, English, and multilingual text seamlessly."""
+    if not text:
+        return [""]
+
+    max_px = max(60.0, max_px)
+    lines = []
+
+    for raw_line in text.splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+
+        if metrics.horizontalAdvance(raw_line) <= max_px:
+            lines.append(raw_line)
+            continue
+
+        # Split on space or ZWSP if available
+        tokens = re.split(r'(\s+|\u200b)', raw_line)
+
+        # Pre-process tokens: split any single token wider than max_px into sub-tokens
+        sub_tokens = []
+        for token in tokens:
+            if not token:
+                continue
+            if metrics.horizontalAdvance(token) <= max_px or token.isspace():
+                sub_tokens.append(token)
+            else:
+                char_buf = ""
+                for char in token:
+                    if metrics.horizontalAdvance(char_buf + char) <= max_px:
+                        char_buf += char
+                    else:
+                        if char_buf:
+                            sub_tokens.append(char_buf)
+                        char_buf = char
+                if char_buf:
+                    sub_tokens.append(char_buf)
+
+        # Accumulate sub_tokens into lines <= max_px
+        current_line = ""
+        for st in sub_tokens:
+            if not current_line:
+                current_line = st
+            elif metrics.horizontalAdvance(current_line + st) <= max_px:
+                current_line += st
+            else:
+                if current_line.strip():
+                    lines.append(current_line.strip())
+                current_line = st.lstrip()
+
+        if current_line.strip():
+            lines.append(current_line.strip())
+
+    return lines or [text]
 
 
 class VideoOverlayCanvas(QWidget):
@@ -33,6 +92,7 @@ class VideoOverlayCanvas(QWidget):
         self.setAcceptDrops(True)
 
         self.video_has_loaded: bool = False
+        self.aspect_ratio_mode: str = "Original (Keep)"
 
         # Active Subtitle Properties
         self.sub_text: str = ""
@@ -174,7 +234,14 @@ class VideoOverlayCanvas(QWidget):
             return
         W = float(max(1, self.width()))
         H = float(max(1, self.height()))
-        blur_rect = QRectF(self.blur_x_pct * W, self.blur_y_pct * H, self.blur_w_pct * W, self.blur_h_pct * H)
+        
+        frame_rect = self.get_inner_video_rect() if self.video_has_loaded else QRectF(0, 0, W, H)
+        bx = frame_rect.left() + self.blur_x_pct * frame_rect.width()
+        by = frame_rect.top() + self.blur_y_pct * frame_rect.height()
+        bw = self.blur_w_pct * frame_rect.width()
+        bh = self.blur_h_pct * frame_rect.height()
+        blur_rect = QRectF(bx, by, bw, bh)
+        
         frame = provider(blur_rect)
         if frame is not None and not frame.isNull():
             self._blur_preview_cache = self._fast_blur_image(frame, self.blur_radius)
@@ -198,6 +265,91 @@ class VideoOverlayCanvas(QWidget):
     def set_video_loaded(self, loaded: bool):
         self.video_has_loaded = loaded
         self.update()
+
+    def set_aspect_ratio_mode(self, mode: str):
+        """Set active display aspect ratio (e.g. '9:16 (Portrait)', '16:9 (Landscape)', 'Original (Keep)')."""
+        self.aspect_ratio_mode = mode
+        self.update()
+
+    def set_video_aspect_ratio(self, aspect: float):
+        """Set original source video aspect ratio (width / height)."""
+        if aspect > 0.1:
+            self.video_aspect_ratio = aspect
+            self.update()
+
+    def get_active_video_rect(self) -> QRectF:
+        """Calculate container aspect frame rectangle inside canvas (W, H)."""
+        W = float(max(1, self.width()))
+        H = float(max(1, self.height()))
+        mode = getattr(self, 'aspect_ratio_mode', 'Original (Keep)')
+
+        target_aspect = None
+        if "9:16" in mode:
+            target_aspect = 9.0 / 16.0
+        elif "16:9" in mode:
+            target_aspect = 16.0 / 9.0
+        elif "1:1" in mode:
+            target_aspect = 1.0 / 1.0
+        elif "4:5" in mode:
+            target_aspect = 4.0 / 5.0
+
+        if target_aspect is not None:
+            if (W / H) > target_aspect:
+                fh = H
+                fw = H * target_aspect
+                fx = (W - fw) / 2.0
+                fy = 0.0
+            else:
+                fw = W
+                fh = W / target_aspect
+                fx = 0.0
+                fy = (H - fh) / 2.0
+            return QRectF(fx, fy, fw, fh)
+
+        return QRectF(0, 0, W, H)
+
+    def get_inner_video_rect(self) -> QRectF:
+        """Calculate actual inner video image rectangle (accounting for letterboxing/pillarboxing)."""
+        active_rect = self.get_active_video_rect()
+        fx, fy = active_rect.left(), active_rect.top()
+        fw, fh = active_rect.width(), active_rect.height()
+        v_aspect = getattr(self, 'video_aspect_ratio', 16.0 / 9.0)
+
+        if (fw / fh) > v_aspect:
+            vh = fh
+            vw = fh * v_aspect
+            vx = fx + (fw - vw) / 2.0
+            vy = fy
+        else:
+            vw = fw
+            vh = fw / v_aspect
+            vx = fx
+            vy = fy + (fh - vh) / 2.0
+        return QRectF(vx, vy, vw, vh)
+
+    def get_relative_blur_config(self) -> Dict[str, Any]:
+        """Return blur box coordinates (0.0 to 1.0) relative to the active video frame."""
+        return {
+            "x": max(0.0, min(0.95, float(self.blur_x_pct))),
+            "y": max(0.0, min(0.95, float(self.blur_y_pct))),
+            "w": max(0.03, min(1.0, float(self.blur_w_pct))),
+            "h": max(0.03, min(1.0, float(self.blur_h_pct))),
+            "enabled": self.blur_enabled,
+            "radius": self.blur_radius,
+            "color": self.blur_color,
+            "opacity": self.blur_opacity
+        }
+
+    def get_relative_logo_config(self) -> Dict[str, Any]:
+        """Return logo box coordinates (0.0 to 1.0) relative to the inner video image."""
+        return {
+            "path": self.logo_path,
+            "x": max(0.0, min(0.95, float(self.logo_x_pct))),
+            "y": max(0.0, min(0.95, float(self.logo_y_pct))),
+            "w": max(0.01, min(1.0, float(self.logo_w_pct))),
+            "h": max(0.01, min(1.0, float(self.logo_h_pct))),
+            "enabled": self.logo_enabled
+        }
 
     def update_playback_position(self, current_ms: int, subtitles: List[SubtitleItem]):
         """Real-time synchronization loop: find active subtitle at current_ms and keep Z-index on top."""
@@ -366,7 +518,27 @@ class VideoOverlayCanvas(QWidget):
         if W <= 0 or H <= 0:
             return
 
-        # 0. Center Upload Card if no video is loaded
+        # 0. Render Aspect Ratio Guide Frame (e.g. 9:16 Portrait boundary outline & letterbox dimming)
+        mode = getattr(self, 'aspect_ratio_mode', 'Original (Keep)')
+        if mode != "Original (Keep)" and self.video_has_loaded:
+            active_rect = self.get_active_video_rect()
+            painter.save()
+            outer_path = QPainterPath()
+            outer_path.addRect(QRectF(0, 0, W, H))
+            inner_path = QPainterPath()
+            inner_path.addRect(active_rect)
+            mask_path = outer_path.subtracted(inner_path)
+
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 150))
+            painter.drawPath(mask_path)
+
+            painter.setPen(QPen(QColor(59, 130, 246, 200), 1.5, Qt.DashLine))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(active_rect)
+            painter.restore()
+
+        # Center Upload Card if no video is loaded
         if not self.video_has_loaded:
             cw, ch = 340, 150
             cx = (W - cw) / 2.0
@@ -391,10 +563,11 @@ class VideoOverlayCanvas(QWidget):
 
             # 1. Render Blur Box Mask (if enabled)
         if self.blur_enabled:
-            bx = self.blur_x_pct * W
-            by = self.blur_y_pct * H
-            bw = self.blur_w_pct * W
-            bh = self.blur_h_pct * H
+            frame_rect = self.get_inner_video_rect() if self.video_has_loaded else QRectF(0, 0, W, H)
+            bx = frame_rect.left() + self.blur_x_pct * frame_rect.width()
+            by = frame_rect.top() + self.blur_y_pct * frame_rect.height()
+            bw = self.blur_w_pct * frame_rect.width()
+            bh = self.blur_h_pct * frame_rect.height()
             blur_rect = QRectF(bx, by, bw, bh)
 
             path = QPainterPath()
@@ -489,10 +662,11 @@ class VideoOverlayCanvas(QWidget):
 
         # 2. Render Logo / Watermark Overlay (if enabled)
         if self.logo_enabled and self.logo_pixmap and not self.logo_pixmap.isNull():
-            lx = self.logo_x_pct * W
-            ly = self.logo_y_pct * H
-            lw = self.logo_w_pct * W
-            lh = self.logo_h_pct * H
+            frame_rect = self.get_inner_video_rect() if self.video_has_loaded else QRectF(0, 0, W, H)
+            lx = frame_rect.left() + self.logo_x_pct * frame_rect.width()
+            ly = frame_rect.top() + self.logo_y_pct * frame_rect.height()
+            lw = self.logo_w_pct * frame_rect.width()
+            lh = self.logo_h_pct * frame_rect.height()
             logo_rect = QRectF(lx, ly, lw, lh)
 
             painter.drawPixmap(logo_rect.toRect(), self.logo_pixmap)
@@ -508,43 +682,42 @@ class VideoOverlayCanvas(QWidget):
 
     def _measure_subtitle_box(self, W: float, H: float):
         """Compute subtitle box geometry — shared by paint() AND hit-testing so the
-        drag/resize handles always line up with what's actually drawn."""
+        drag/resize handles always line up with what's actually drawn.
+        Strictly constrained within active video frame boundaries (e.g. 9:16 vertical frame)."""
+        active_rect = self.get_active_video_rect()
+        ax, ay = active_rect.left(), active_rect.top()
+        aw, ah = active_rect.width(), active_rect.height()
+
         font_weight = QFont.Bold if self.sub_bold else QFont.Normal
-        scale_ratio = H / 720.0  # Scale font proportionally to container height
-        rel_font_size = max(14, int(self.sub_font_size * max(0.6, scale_ratio)))
+        scale_ratio = ah / 720.0  # Scale font proportionally to container height
+        rel_font_size = max(13, int(self.sub_font_size * max(0.6, scale_ratio)))
 
         font = QFont(self.sub_font_family, rel_font_size, font_weight)
         font.setItalic(self.sub_italic)
         metrics = QFontMetrics(font)
 
-        # Automatic Line Wrapping (Max 2 lines)
-        lines = self.sub_text.splitlines() or [""]
-        if len(lines) == 1 and len(self.sub_text) > 42:
-            mid = len(self.sub_text) // 2
-            space_idx = self.sub_text.find(" ", mid)
-            if space_idx != -1:
-                lines = [self.sub_text[:space_idx].strip(), self.sub_text[space_idx:].strip()]
-            else:
-                lines = [self.sub_text]
+        # Max allowed width inside active video frame (88% of active width)
+        max_allowed_width = max(100.0, aw * 0.88)
+        lines = wrap_text_to_pixel_width(self.sub_text, metrics, max_allowed_width - 32)
 
         line_height = metrics.height()
         total_height = line_height * len(lines) + 16
         max_line_w = max([metrics.horizontalAdvance(l) for l in lines] or [120])
-        total_width = max(140, max_line_w + 32)
+        total_width = min(max_allowed_width, max(120.0, max_line_w + 32))
 
-        # Compute position from relative percentages
+        # Compute position relative to active_rect
         if self.sub_alignment == "Bottom Left":
-            sx = self.sub_x_pct * W
+            sx = ax + (self.sub_x_pct * aw)
         elif self.sub_alignment == "Bottom Right":
-            sx = self.sub_x_pct * W - total_width
+            sx = ax + (self.sub_x_pct * aw) - total_width
         else:  # Center
-            sx = self.sub_x_pct * W - (total_width / 2.0)
+            sx = ax + (self.sub_x_pct * aw) - (total_width / 2.0)
 
-        sy = self.sub_y_pct * H - (total_height / 2.0)
+        sy = ay + (self.sub_y_pct * ah) - (total_height / 2.0)
 
-        # Safe area bounds constraint
-        sx = max(10, min(W - total_width - 10, sx))
-        sy = max(10, min(H - total_height - 10, sy))
+        # Safe area bounds constraint — strictly inside active video frame
+        sx = max(ax + 4, min(ax + aw - total_width - 4, sx))
+        sy = max(ay + 4, min(ay + ah - total_height - 4, sy))
 
         return sx, sy, total_width, total_height, lines, line_height, font, metrics
 
@@ -669,10 +842,11 @@ class VideoOverlayCanvas(QWidget):
 
             # Logo handles hit test
             if self.logo_enabled:
-                lx = self.logo_x_pct * W
-                ly = self.logo_y_pct * H
-                lw = self.logo_w_pct * W
-                lh = self.logo_h_pct * H
+                frame_rect = self.get_inner_video_rect() if self.video_has_loaded else QRectF(0, 0, W, H)
+                lx = frame_rect.left() + self.logo_x_pct * frame_rect.width()
+                ly = frame_rect.top() + self.logo_y_pct * frame_rect.height()
+                lw = self.logo_w_pct * frame_rect.width()
+                lh = self.logo_h_pct * frame_rect.height()
                 if QRectF(lx + lw - 15, ly + lh - 15, 20, 20).contains(pos):
                     self._dragging_target = "logo_resize"
                     self._drag_start_pos = pos
@@ -686,10 +860,11 @@ class VideoOverlayCanvas(QWidget):
 
             # Blur handles hit test
             if self.blur_enabled:
-                bx = self.blur_x_pct * W
-                by = self.blur_y_pct * H
-                bw = self.blur_w_pct * W
-                bh = self.blur_h_pct * H
+                frame_rect = self.get_inner_video_rect() if self.video_has_loaded else QRectF(0, 0, W, H)
+                bx = frame_rect.left() + self.blur_x_pct * frame_rect.width()
+                by = frame_rect.top() + self.blur_y_pct * frame_rect.height()
+                bw = self.blur_w_pct * frame_rect.width()
+                bh = self.blur_h_pct * frame_rect.height()
 
                 # Delete (✖) Button
                 if QRectF(bx + bw + 2, by - 22, 22, 22).contains(pos):
@@ -763,59 +938,15 @@ class VideoOverlayCanvas(QWidget):
         H = float(max(1, self.height()))
 
         if self._dragging_target == "sub":
+            active_rect = self.get_active_video_rect()
+            ax, ay = active_rect.left(), active_rect.top()
+            aw, ah = float(max(1, active_rect.width())), float(max(1, active_rect.height()))
+
             new_cx = self._element_start_rect.center().x() + delta_x
             new_cy = self._element_start_rect.center().y() + delta_y
-            self.sub_x_pct = max(0.05, min(0.95, new_cx / W))
-            self.sub_y_pct = max(0.05, min(0.95, new_cy / H))
+            self.sub_x_pct = max(0.05, min(0.95, (new_cx - ax) / aw))
+            self.sub_y_pct = max(0.05, min(0.95, (new_cy - ay) / ah))
             self.subtitle_pos_changed.emit(self.sub_x_pct, self.sub_y_pct)
-
-        elif self._dragging_target == "blur":
-            new_x = self._element_start_rect.x() + delta_x
-            new_y = self._element_start_rect.y() + delta_y
-            self.blur_x_pct = max(0.0, min(0.9, new_x / W))
-            self.blur_y_pct = max(0.0, min(0.9, new_y / H))
-            self.blur_changed.emit(self.blur_x_pct, self.blur_y_pct, self.blur_w_pct, self.blur_h_pct, self.blur_enabled)
-            print(f"[DEBUG LOG] Blur moved | pos=({self.blur_x_pct:.3f},{self.blur_y_pct:.3f}) | size=({self.blur_w_pct:.3f}x{self.blur_h_pct:.3f}) | zValue=9999 | visible=True")
-
-        elif self._dragging_target == "blur_br":
-            new_w = max(30, self._element_start_rect.width() + delta_x)
-            new_h = max(20, self._element_start_rect.height() + delta_y)
-            self.blur_w_pct = max(0.03, min(0.95, new_w / W))
-            self.blur_h_pct = max(0.03, min(0.95, new_h / H))
-            self.blur_changed.emit(self.blur_x_pct, self.blur_y_pct, self.blur_w_pct, self.blur_h_pct, self.blur_enabled)
-            print(f"[DEBUG LOG] Blur resized BR | size=({self.blur_w_pct:.3f}x{self.blur_h_pct:.3f})")
-
-        elif self._dragging_target == "blur_tl":
-            new_x = self._element_start_rect.x() + delta_x
-            new_y = self._element_start_rect.y() + delta_y
-            new_w = max(30, self._element_start_rect.width() - delta_x)
-            new_h = max(20, self._element_start_rect.height() - delta_y)
-            self.blur_x_pct = max(0.0, min(0.9, new_x / W))
-            self.blur_y_pct = max(0.0, min(0.9, new_y / H))
-            self.blur_w_pct = max(0.03, min(0.95, new_w / W))
-            self.blur_h_pct = max(0.03, min(0.95, new_h / H))
-            self.blur_changed.emit(self.blur_x_pct, self.blur_y_pct, self.blur_w_pct, self.blur_h_pct, self.blur_enabled)
-            print(f"[DEBUG LOG] Blur resized TL | pos=({self.blur_x_pct:.3f},{self.blur_y_pct:.3f}) size=({self.blur_w_pct:.3f}x{self.blur_h_pct:.3f})")
-
-        elif self._dragging_target == "blur_tr":
-            new_y = self._element_start_rect.y() + delta_y
-            new_w = max(30, self._element_start_rect.width() + delta_x)
-            new_h = max(20, self._element_start_rect.height() - delta_y)
-            self.blur_y_pct = max(0.0, min(0.9, new_y / H))
-            self.blur_w_pct = max(0.03, min(0.95, new_w / W))
-            self.blur_h_pct = max(0.03, min(0.95, new_h / H))
-            self.blur_changed.emit(self.blur_x_pct, self.blur_y_pct, self.blur_w_pct, self.blur_h_pct, self.blur_enabled)
-            print(f"[DEBUG LOG] Blur resized TR | pos=({self.blur_x_pct:.3f},{self.blur_y_pct:.3f}) size=({self.blur_w_pct:.3f}x{self.blur_h_pct:.3f})")
-
-        elif self._dragging_target == "blur_bl":
-            new_x = self._element_start_rect.x() + delta_x
-            new_w = max(30, self._element_start_rect.width() - delta_x)
-            new_h = max(20, self._element_start_rect.height() + delta_y)
-            self.blur_x_pct = max(0.0, min(0.9, new_x / W))
-            self.blur_w_pct = max(0.03, min(0.95, new_w / W))
-            self.blur_h_pct = max(0.03, min(0.95, new_h / H))
-            self.blur_changed.emit(self.blur_x_pct, self.blur_y_pct, self.blur_w_pct, self.blur_h_pct, self.blur_enabled)
-            print(f"[DEBUG LOG] Blur resized BL | pos=({self.blur_x_pct:.3f},{self.blur_y_pct:.3f}) size=({self.blur_w_pct:.3f}x{self.blur_h_pct:.3f})")
 
         elif self._dragging_target == "sub_resize":
             start_w = max(1.0, self._element_start_rect.width())
@@ -825,19 +956,67 @@ class VideoOverlayCanvas(QWidget):
             if new_size != self.sub_font_size:
                 self.sub_font_size = new_size
 
-        elif self._dragging_target == "logo":
-            new_x = self._element_start_rect.x() + delta_x
-            new_y = self._element_start_rect.y() + delta_y
-            self.logo_x_pct = max(0.0, min(0.9, new_x / W))
-            self.logo_y_pct = max(0.0, min(0.9, new_y / H))
-            self.logo_changed.emit(self.logo_path, self.logo_x_pct, self.logo_y_pct, self.logo_w_pct, self.logo_h_pct, self.logo_enabled)
+        elif self._dragging_target.startswith("blur") or self._dragging_target.startswith("logo"):
+            frame_rect = self.get_inner_video_rect() if self.video_has_loaded else QRectF(0, 0, W, H)
+            ax, ay = frame_rect.left(), frame_rect.top()
+            aw, ah = float(max(1, frame_rect.width())), float(max(1, frame_rect.height()))
 
-        elif self._dragging_target == "logo_resize":
-            new_w = max(20, self._element_start_rect.width() + delta_x)
-            new_h = max(20, self._element_start_rect.height() + delta_y)
-            self.logo_w_pct = max(0.02, min(0.8, new_w / W))
-            self.logo_h_pct = max(0.02, min(0.8, new_h / H))
-            self.logo_changed.emit(self.logo_path, self.logo_x_pct, self.logo_y_pct, self.logo_w_pct, self.logo_h_pct, self.logo_enabled)
+            if self._dragging_target == "blur":
+                new_x = self._element_start_rect.x() + delta_x
+                new_y = self._element_start_rect.y() + delta_y
+                self.blur_x_pct = max(0.0, min(0.95, (new_x - ax) / aw))
+                self.blur_y_pct = max(0.0, min(0.95, (new_y - ay) / ah))
+                self.blur_changed.emit(self.blur_x_pct, self.blur_y_pct, self.blur_w_pct, self.blur_h_pct, self.blur_enabled)
+
+            elif self._dragging_target == "blur_br":
+                new_w = max(20.0, self._element_start_rect.width() + delta_x)
+                new_h = max(15.0, self._element_start_rect.height() + delta_y)
+                self.blur_w_pct = max(0.03, min(1.0, new_w / aw))
+                self.blur_h_pct = max(0.03, min(1.0, new_h / ah))
+                self.blur_changed.emit(self.blur_x_pct, self.blur_y_pct, self.blur_w_pct, self.blur_h_pct, self.blur_enabled)
+
+            elif self._dragging_target == "blur_tl":
+                new_x = self._element_start_rect.x() + delta_x
+                new_y = self._element_start_rect.y() + delta_y
+                new_w = max(20.0, self._element_start_rect.width() - delta_x)
+                new_h = max(15.0, self._element_start_rect.height() - delta_y)
+                self.blur_x_pct = max(0.0, min(0.95, (new_x - ax) / aw))
+                self.blur_y_pct = max(0.0, min(0.95, (new_y - ay) / ah))
+                self.blur_w_pct = max(0.03, min(1.0, new_w / aw))
+                self.blur_h_pct = max(0.03, min(1.0, new_h / ah))
+                self.blur_changed.emit(self.blur_x_pct, self.blur_y_pct, self.blur_w_pct, self.blur_h_pct, self.blur_enabled)
+
+            elif self._dragging_target == "blur_tr":
+                new_y = self._element_start_rect.y() + delta_y
+                new_w = max(20.0, self._element_start_rect.width() + delta_x)
+                new_h = max(15.0, self._element_start_rect.height() - delta_y)
+                self.blur_y_pct = max(0.0, min(0.95, (new_y - ay) / ah))
+                self.blur_w_pct = max(0.03, min(1.0, new_w / aw))
+                self.blur_h_pct = max(0.03, min(1.0, new_h / ah))
+                self.blur_changed.emit(self.blur_x_pct, self.blur_y_pct, self.blur_w_pct, self.blur_h_pct, self.blur_enabled)
+
+            elif self._dragging_target == "blur_bl":
+                new_x = self._element_start_rect.x() + delta_x
+                new_w = max(20.0, self._element_start_rect.width() - delta_x)
+                new_h = max(15.0, self._element_start_rect.height() + delta_y)
+                self.blur_x_pct = max(0.0, min(0.95, (new_x - ax) / aw))
+                self.blur_w_pct = max(0.03, min(1.0, new_w / aw))
+                self.blur_h_pct = max(0.03, min(1.0, new_h / ah))
+                self.blur_changed.emit(self.blur_x_pct, self.blur_y_pct, self.blur_w_pct, self.blur_h_pct, self.blur_enabled)
+
+            elif self._dragging_target == "logo":
+                new_x = self._element_start_rect.x() + delta_x
+                new_y = self._element_start_rect.y() + delta_y
+                self.logo_x_pct = max(0.0, min(0.95, (new_x - ax) / aw))
+                self.logo_y_pct = max(0.0, min(0.95, (new_y - ay) / ah))
+                self.logo_changed.emit(self.logo_path, self.logo_x_pct, self.logo_y_pct, self.logo_w_pct, self.logo_h_pct, self.logo_enabled)
+
+            elif self._dragging_target == "logo_resize":
+                new_w = max(20.0, self._element_start_rect.width() + delta_x)
+                new_h = max(20.0, self._element_start_rect.height() + delta_y)
+                self.logo_w_pct = max(0.02, min(0.8, new_w / aw))
+                self.logo_h_pct = max(0.02, min(0.8, new_h / ah))
+                self.logo_changed.emit(self.logo_path, self.logo_x_pct, self.logo_y_pct, self.logo_w_pct, self.logo_h_pct, self.logo_enabled)
 
         self.update()
         self.raise_()

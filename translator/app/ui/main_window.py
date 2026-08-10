@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QLabel, QPushButton, QFileDialog, QProgressBar, QStatusBar,
     QMessageBox, QSlider, QFrame, QMenu, QMenuBar, QComboBox, QDialog,
-    QGraphicsView, QGraphicsScene, QColorDialog, QApplication
+    QGraphicsView, QGraphicsScene, QColorDialog, QCheckBox, QApplication
 )
 from PySide6.QtCore import Qt, QUrl, QTimer, QSize, Signal, QRectF
 from PySide6.QtGui import QIcon, QFont, QDragEnterEvent, QDropEvent, QPainter, QColor, QImage
@@ -145,6 +145,9 @@ class VideoPlayerWidget(QFrame):
         ])
         self.combo_orig_vol.setCurrentText("🔊 Orig Vol: 20%")
 
+        self.chk_mute_all = QCheckBox("Mute All Audio")
+        self.chk_mute_all.setToolTip("Completely mute all original audio (including background noise and sound effects) everywhere.")
+
         self.lbl_current_time = QLabel("00:00.00")
         self.lbl_duration = QLabel("00:00.00")
 
@@ -166,6 +169,7 @@ class VideoPlayerWidget(QFrame):
         ctrl_layout.addWidget(self.btn_duck_bg)
         ctrl_layout.addWidget(self.combo_ratio)
         ctrl_layout.addWidget(self.combo_orig_vol)
+        ctrl_layout.addWidget(self.chk_mute_all)
         ctrl_layout.addStretch()
         ctrl_layout.addWidget(self.lbl_current_time)
         ctrl_layout.addWidget(QLabel("/"))
@@ -181,10 +185,14 @@ class VideoPlayerWidget(QFrame):
         self.btn_logo.clicked.connect(self._on_select_logo)
         self.btn_add_blur.clicked.connect(self._on_add_blur)
         self.btn_add_sub.clicked.connect(self._on_add_subtitle)
+        self.combo_ratio.currentTextChanged.connect(self._on_aspect_ratio_changed)
         self.overlay_canvas.upload_clicked.connect(self._on_upload_click_from_canvas)
         self.overlay_canvas.video_dropped.connect(self.load_video)
         self.player.positionChanged.connect(self._on_position_changed)
         self.player.durationChanged.connect(self._on_duration_changed)
+
+    def _on_aspect_ratio_changed(self, text: str):
+        self.overlay_canvas.set_aspect_ratio_mode(text)
 
     def set_subtitles(self, subtitles: List[SubtitleItem]):
         self.subtitles_ref = subtitles
@@ -375,8 +383,14 @@ class VideoPlayerWidget(QFrame):
         import re
         vol_match = re.search(r'\d+', self.combo_orig_vol.currentText())
         vol_pct = int(vol_match.group()) if vol_match else 20
-        target_vol = (vol_pct / 100.0) if (self.btn_duck_bg.isChecked() and is_speech_interval) else 1.0
-        self.audio_output.setVolume(target_vol)
+        
+        if hasattr(self, 'chk_mute_all') and self.chk_mute_all.isChecked():
+            target_vol = 0.0
+        else:
+            target_vol = (vol_pct / 100.0) if (self.btn_duck_bg.isChecked() and is_speech_interval) else 1.0
+            
+        master_vol = self.slider_vol.value() / 100.0
+        self.audio_output.setVolume(target_vol * master_vol)
 
         # Real-time Khmer TTS Voice Sync during video preview
         if self.subtitles_ref and self.player.playbackState() == QMediaPlayer.PlayingState:
@@ -738,6 +752,10 @@ class MainWindow(QMainWindow):
         self.subtitle_editor.load_subtitles([])
         self.timeline_widget.load_subtitles([])
 
+        vw, vh = self.ffmpeg_mgr.get_video_dimensions(video_path)
+        if vh > 0:
+            self.video_player.overlay_canvas.set_video_aspect_ratio(float(vw) / float(vh))
+
         self.status_bar.showMessage(f"Loaded Video: {os.path.basename(video_path)} — Extracting audio in background...")
         self.progress_bar.show()
 
@@ -990,26 +1008,10 @@ class MainWindow(QMainWindow):
         self.export_progress_dlg = RenderProgressDialog(save_path, self)
         self.export_progress_dlg.show()
 
-        # Extract Logo and Blur configuration from interactive VideoOverlayCanvas
+        # Extract Logo and Blur configuration relative to active video frame from VideoOverlayCanvas
         canvas = self.video_player.overlay_canvas
-        logo_cfg = {
-            "path": canvas.logo_path,
-            "x": canvas.logo_x_pct,
-            "y": canvas.logo_y_pct,
-            "w": canvas.logo_w_pct,
-            "h": canvas.logo_h_pct,
-            "enabled": canvas.logo_enabled
-        }
-        blur_cfg = {
-            "x": canvas.blur_x_pct,
-            "y": canvas.blur_y_pct,
-            "w": canvas.blur_w_pct,
-            "h": canvas.blur_h_pct,
-            "enabled": canvas.blur_enabled,
-            "radius": canvas.blur_radius,
-            "color": canvas.blur_color,
-            "opacity": canvas.blur_opacity
-        }
+        logo_cfg = canvas.get_relative_logo_config()
+        blur_cfg = canvas.get_relative_blur_config()
 
         lead_text = self.timeline_widget.combo_lead_offset.currentText()
         offset_ms = 0
@@ -1034,8 +1036,9 @@ class MainWindow(QMainWindow):
             "logo_config": logo_cfg,
             "blur_config": blur_cfg,
             "mute_original_audio": self.video_player.btn_duck_bg.isChecked(),
+            "mute_all_audio": self.chk_mute_all.isChecked(),
             "audio_offset_ms": offset_ms,
-            "aspect_ratio": cfg["preset"],
+            "aspect_ratio": canvas.aspect_ratio_mode,
             "orig_audio_vol_pct": orig_vol_pct
         }
 
