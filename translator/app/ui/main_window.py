@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QColorDialog, QCheckBox, QApplication
 )
 from PySide6.QtCore import Qt, QUrl, QTimer, QSize, Signal, QRectF
-from PySide6.QtGui import QIcon, QFont, QDragEnterEvent, QDropEvent, QPainter, QColor, QImage
+from PySide6.QtGui import QIcon, QFont, QDragEnterEvent, QDropEvent, QPainter, QColor, QImage, QPixmap
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget, QGraphicsVideoItem
 
@@ -426,6 +426,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"Dubify AI PRO - v{APP_VERSION}")
+        icon_path = os.path.join(os.path.dirname(__file__), "..", "assets", "logo.ico")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
         self.setMinimumSize(960, 600)
         self._fit_to_screen(1280, 800)
 
@@ -466,9 +469,15 @@ class MainWindow(QMainWindow):
         header_frame.setObjectName("HeaderFrame")
         header_layout = QHBoxLayout(header_frame)
 
+        lbl_logo_icon = QLabel()
+        logo_path = os.path.join(os.path.dirname(__file__), "..", "assets", "logo.png")
+        logo_pixmap = QPixmap(logo_path)
+        if not logo_pixmap.isNull():
+            lbl_logo_icon.setPixmap(logo_pixmap.scaledToHeight(34, Qt.SmoothTransformation))
+
         lbl_logo = QLabel("Dubify AI")
         lbl_logo.setObjectName("AppTitle")
-        
+
         lbl_pro = QLabel("PRO")
         lbl_pro.setObjectName("ProBadge")
 
@@ -491,6 +500,7 @@ class MainWindow(QMainWindow):
         self.btn_settings = QPushButton("Settings")
         self.btn_settings.clicked.connect(self._open_settings)
 
+        header_layout.addWidget(lbl_logo_icon)
         header_layout.addWidget(lbl_logo)
         header_layout.addWidget(lbl_pro)
         header_layout.addSpacing(10)
