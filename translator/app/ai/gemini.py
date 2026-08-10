@@ -26,10 +26,10 @@ Output STRICTLY in this format, one subtitle per line, nothing else (no headers,
 # older, less-contended model on 404 OR 429 instead of surfacing a confusing failure
 # or burning through every rotated key for nothing.
 MODEL_FALLBACK_CHAIN = {
-    "gemini-2.5-flash": ["gemini-2.0-flash", "gemini-1.5-flash"],
-    "gemini-2.5-pro": ["gemini-2.0-flash", "gemini-1.5-pro"],
-    "gemini-2.0-flash": ["gemini-1.5-flash"],
-    "gemini-2.0-pro": ["gemini-1.5-pro"],
+    "gemini-2.5-flash": ["gemini-2.0-flash", "gemini-flash-latest"],
+    "gemini-2.5-pro": ["gemini-2.0-flash", "gemini-pro-latest"],
+    "gemini-2.0-flash": ["gemini-flash-latest"],
+    "gemini-2.0-pro": ["gemini-pro-latest"],
 }
 _FALLBACK_TRIGGER_CODES = (404, 429)
 

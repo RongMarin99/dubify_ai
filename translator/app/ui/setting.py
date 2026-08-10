@@ -15,7 +15,9 @@ from PySide6.QtGui import QColor, QFont, QIcon
 from ..database.sqlite import DatabaseManager
 from ..ai.gemini import NETFLIX_MASTER_PROMPT, test_gemini_key
 from ..ai.local_models import LocalModelManager
-from ..utils.crypto import decrypt_api_key, mask_api_key
+from ..utils.crypto import decrypt_api_key, mask_api_key, encrypt_api_key
+from ..core.updater import UpdateCheckWorker
+from ..version import APP_VERSION, GITHUB_OWNER, GITHUB_REPO
 
 
 class KeyTesterThread(QThread):
@@ -355,12 +357,14 @@ class SettingsDialog(QDialog):
         item_keys = SettingsNavItemWidget(3, "🔑", "Gemini API Keys", "Rotation & Load Balancer")
         item_local = SettingsNavItemWidget(4, "💻", "Local Models", "Ollama & Offline Models")
         item_perf = SettingsNavItemWidget(5, "⚡", "Performance", "CUDA, VRAM & Threads")
+        item_update = SettingsNavItemWidget(6, "🔄", "Updates", f"v{APP_VERSION} — Check for new release")
 
         sidebar_layout.addWidget(item_keys)
         sidebar_layout.addWidget(item_local)
         sidebar_layout.addWidget(item_perf)
+        sidebar_layout.addWidget(item_update)
 
-        self.nav_items = [item_stt, item_trans, item_tts, item_keys, item_local, item_perf]
+        self.nav_items = [item_stt, item_trans, item_tts, item_keys, item_local, item_perf, item_update]
         for nav_item in self.nav_items:
             nav_item.clicked.connect(self._select_nav_page)
 
@@ -401,6 +405,7 @@ class SettingsDialog(QDialog):
         self.page_keys = self._create_keys_page()
         self.page_local = self._create_local_page()
         self.page_perf = self._create_perf_page()
+        self.page_update = self._create_update_page()
 
         self.stack.addWidget(self.page_stt)
         self.stack.addWidget(self.page_trans)
@@ -408,6 +413,7 @@ class SettingsDialog(QDialog):
         self.stack.addWidget(self.page_keys)
         self.stack.addWidget(self.page_local)
         self.stack.addWidget(self.page_perf)
+        self.stack.addWidget(self.page_update)
 
         body_layout.addWidget(sidebar_frame)
         body_layout.addWidget(self.stack, 1)
@@ -1183,6 +1189,75 @@ class SettingsDialog(QDialog):
         return page
 
     # ----------------------------------------------------
+    # SECTION 7: Updates
+    # ----------------------------------------------------
+    def _create_update_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        grp_info = QGroupBox("Current Version")
+        il = QVBoxLayout(grp_info)
+        il.addWidget(QLabel(f"Dubify AI PRO v{APP_VERSION}"))
+        il.addWidget(QLabel(f"Update source: github.com/{GITHUB_OWNER}/{GITHUB_REPO} (private)"))
+        layout.addWidget(grp_info)
+
+        grp_token = QGroupBox("GitHub Access Token")
+        tl = QVBoxLayout(grp_token)
+        tl.addWidget(QLabel(
+            "Since the repo is private, a token is needed to check/download releases.\n"
+            "Use a fine-grained Personal Access Token scoped to ONLY this repo, with\n"
+            "read-only 'Contents' permission — never a token with write/admin access."
+        ))
+        self.edit_update_token = QLineEdit()
+        self.edit_update_token.setEchoMode(QLineEdit.Password)
+        self.edit_update_token.setPlaceholderText("github_pat_...")
+        tl.addWidget(self.edit_update_token)
+        layout.addWidget(grp_token)
+
+        grp_check = QGroupBox("Check Now")
+        cl = QVBoxLayout(grp_check)
+        row = QHBoxLayout()
+        self.btn_check_update_now = QPushButton("🔄 Check for Updates")
+        self.btn_check_update_now.clicked.connect(self._on_check_update_now)
+        row.addWidget(self.btn_check_update_now)
+        row.addStretch()
+        cl.addLayout(row)
+        self.lbl_update_status = QLabel("")
+        self.lbl_update_status.setStyleSheet("color: #8c89b4;")
+        self.lbl_update_status.setWordWrap(True)
+        cl.addWidget(self.lbl_update_status)
+        layout.addWidget(grp_check)
+
+        layout.addStretch()
+        return page
+
+    def _on_check_update_now(self):
+        token = self.edit_update_token.text().strip()
+        self.btn_check_update_now.setEnabled(False)
+        self.lbl_update_status.setText("Checking GitHub for a newer release...")
+
+        self._settings_update_checker = UpdateCheckWorker(token=token)
+        self._settings_update_checker.found.connect(self._on_settings_update_found)
+        self._settings_update_checker.none_found.connect(self._on_settings_update_none)
+        self._settings_update_checker.failed.connect(self._on_settings_update_failed)
+        self._settings_update_checker.finished.connect(lambda: self.btn_check_update_now.setEnabled(True))
+        self._settings_update_checker.start()
+
+    def _on_settings_update_found(self, info: dict):
+        self.lbl_update_status.setText(
+            f"✅ Update available: {info['tag']} ({info['asset_name']}). "
+            f"Close Settings and use the Update button in the top bar to install it."
+        )
+
+    def _on_settings_update_none(self):
+        self.lbl_update_status.setText(f"You're up to date (v{APP_VERSION}).")
+
+    def _on_settings_update_failed(self, err: str):
+        self.lbl_update_status.setText(f"⚠️ Check failed: {err}")
+
+    # ----------------------------------------------------
     # Load and Save Settings Logic
     # ----------------------------------------------------
     def _load_all_settings(self):
@@ -1247,6 +1322,9 @@ class SettingsDialog(QDialog):
         self.spin_ram_limit.setValue(int(self.db.get_setting("ram_limit_gb", "16")))
         self.spin_vram_limit.setValue(int(self.db.get_setting("vram_limit_gb", "8")))
 
+        # Updates
+        self.edit_update_token.setText(decrypt_api_key(self.db.get_setting("github_update_token", "")))
+
         # Populate tables
         self._refresh_keys_table()
         self._refresh_local_models()
@@ -1305,6 +1383,10 @@ class SettingsDialog(QDialog):
         self.db.set_setting("batch_size", str(self.spin_batch_size.value()))
         self.db.set_setting("ram_limit_gb", str(self.spin_ram_limit.value()))
         self.db.set_setting("vram_limit_gb", str(self.spin_vram_limit.value()))
+
+        # Updates
+        update_token = self.edit_update_token.text().strip()
+        self.db.set_setting("github_update_token", encrypt_api_key(update_token) if update_token else "")
 
         self.accept()
 

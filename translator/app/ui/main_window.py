@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QLabel, QPushButton, QFileDialog, QProgressBar, QStatusBar,
     QMessageBox, QSlider, QFrame, QMenu, QMenuBar, QComboBox, QDialog,
-    QGraphicsView, QGraphicsScene, QColorDialog
+    QGraphicsView, QGraphicsScene, QColorDialog, QApplication
 )
 from PySide6.QtCore import Qt, QUrl, QTimer, QSize, Signal, QRectF
 from PySide6.QtGui import QIcon, QFont, QDragEnterEvent, QDropEvent, QPainter, QColor, QImage
@@ -26,7 +26,10 @@ from ..core.translator import TranslationWorker
 from ..core.tts import TTSWorker
 from ..core.khmer_qa import KhmerAudioQAWorker
 from ..core.exporter import ExportManager
+from ..core.updater import UpdateCheckWorker, UpdateDownloadWorker, apply_update_and_restart
 from ..model.models import SubtitleItem, ProjectModel
+from ..utils.crypto import decrypt_api_key
+from ..version import APP_VERSION
 
 class VideoPlayerWidget(QFrame):
     video_loaded = Signal(str)  # video path
@@ -408,8 +411,9 @@ class VideoPlayerWidget(QFrame):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Dubify AI PRO - v1.4.28")
-        self.resize(1280, 800)
+        self.setWindowTitle(f"Dubify AI PRO - v{APP_VERSION}")
+        self.setMinimumSize(960, 600)
+        self._fit_to_screen(1280, 800)
 
         self.db = DatabaseManager()
         self.cache_mgr = CacheManager(self.db)
@@ -421,6 +425,20 @@ class MainWindow(QMainWindow):
         self._source_lang_code: str = "zh"  # updated by _on_stt_language_detected after each transcription
 
         self._init_ui()
+        self._check_for_updates()
+
+    def _fit_to_screen(self, preferred_w: int, preferred_h: int):
+        """Size/center window to fit whatever screen it's on, and maximize
+        on screens smaller than the preferred size so the video preview
+        never gets clipped on small-resolution PCs."""
+        screen = self.screen() or QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        w = min(preferred_w, avail.width())
+        h = min(preferred_h, avail.height())
+        self.resize(w, h)
+        self.move(avail.x() + (avail.width() - w) // 2, avail.y() + (avail.height() - h) // 2)
+        if avail.width() < preferred_w or avail.height() < preferred_h:
+            self.showMaximized()
 
     def _init_ui(self):
         main_widget = QWidget()
@@ -446,6 +464,15 @@ class MainWindow(QMainWindow):
         self.btn_status_pro = QPushButton("✓ PRO Activated")
         self.btn_status_pro.setObjectName("ProStatusBadge")
 
+        self.btn_update = QPushButton("🔄 Update Available")
+        self.btn_update.setStyleSheet(
+            "background-color: #d97706; color: #ffffff; font-weight: bold; "
+            "border-radius: 4px; padding: 5px 12px; border: 1px solid #fbbf24;"
+        )
+        self.btn_update.clicked.connect(self._on_update_button_clicked)
+        self.btn_update.hide()
+        self._pending_update: Optional[dict] = None
+
         self.btn_settings = QPushButton("Settings")
         self.btn_settings.clicked.connect(self._open_settings)
 
@@ -454,6 +481,7 @@ class MainWindow(QMainWindow):
         header_layout.addSpacing(10)
         header_layout.addWidget(lbl_sub)
         header_layout.addStretch()
+        header_layout.addWidget(self.btn_update)
         header_layout.addWidget(self.btn_status_pro)
         header_layout.addWidget(self.btn_settings)
 
@@ -603,6 +631,66 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self.db, self)
         if dlg.exec():
             self._update_status_bar_badges()
+
+    # ----------------------------------------------------
+    # Auto-Update (private GitHub repo release check/download/install)
+    # ----------------------------------------------------
+    def _check_for_updates(self):
+        token = decrypt_api_key(self.db.get_setting("github_update_token", ""))
+        if not token:
+            return  # no token configured yet — skip silently, don't nag on every launch
+
+        self._update_checker = UpdateCheckWorker(token=token)
+        self._update_checker.found.connect(self._on_update_found)
+        self._update_checker.start()
+
+    def _on_update_found(self, info: dict):
+        self._pending_update = info
+        self.btn_update.setText(f"🔄 Update {info['tag']} Available")
+        self.btn_update.setToolTip(info.get("notes", "") or f"New version {info['tag']} is available.")
+        self.btn_update.show()
+
+    def _on_update_button_clicked(self):
+        if not self._pending_update:
+            return
+        info = self._pending_update
+        reply = QMessageBox.question(
+            self, "Update Available",
+            f"Version {info['tag']} is available (current: v{APP_VERSION}).\n\n"
+            f"{info.get('notes', '')}\n\n"
+            f"Download and install now? The app will restart automatically when done.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        token = decrypt_api_key(self.db.get_setting("github_update_token", ""))
+        self.btn_update.setEnabled(False)
+        self.progress_bar.show()
+        self.status_bar.showMessage("Downloading update...")
+
+        self._update_downloader = UpdateDownloadWorker(info["asset_id"], info["asset_size"], token=token)
+        self._update_downloader.progress.connect(self._on_update_download_progress)
+        self._update_downloader.finished.connect(self._on_update_download_finished)
+        self._update_downloader.failed.connect(self._on_update_download_failed)
+        self._update_downloader.start()
+
+    def _on_update_download_progress(self, pct: int, msg: str):
+        self.progress_bar.setValue(pct)
+        self.status_bar.showMessage(msg)
+
+    def _on_update_download_finished(self, payload_dir: str):
+        self.progress_bar.hide()
+        self.btn_update.setEnabled(True)
+        self.status_bar.showMessage("Update downloaded. Restarting...")
+        apply_update_and_restart(payload_dir)
+        QApplication.quit()
+
+    def _on_update_download_failed(self, err: str):
+        self.progress_bar.hide()
+        self.btn_update.setEnabled(True)
+        self.status_bar.showMessage("Update failed.")
+        QMessageBox.warning(self, "Update Failed", f"Could not download the update:\n\n{err}")
 
     def _open_style_dialog(self):
         dlg = SubtitleStyleDialog(self.db, self)

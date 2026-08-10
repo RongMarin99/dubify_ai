@@ -1,0 +1,4 @@
+# PyInstaller build output (large — ship via GitHub Release zip, not git)
+/build/
+/dist/
+*.spec.bak
