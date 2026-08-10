@@ -683,7 +683,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.show()
         self.status_bar.showMessage("Downloading update...")
 
-        self._update_downloader = UpdateDownloadWorker(info["asset_id"], info["asset_size"], token=token)
+        self._update_downloader = UpdateDownloadWorker(info["asset_id"], info["asset_size"], info["asset_name"], token=token)
         self._update_downloader.progress.connect(self._on_update_download_progress)
         self._update_downloader.finished.connect(self._on_update_download_finished)
         self._update_downloader.failed.connect(self._on_update_download_failed)
@@ -693,11 +693,11 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(pct)
         self.status_bar.showMessage(msg)
 
-    def _on_update_download_finished(self, payload_dir: str):
+    def _on_update_download_finished(self, setup_path: str):
         self.progress_bar.hide()
         self.btn_update.setEnabled(True)
-        self.status_bar.showMessage("Update downloaded. Restarting...")
-        apply_update_and_restart(payload_dir)
+        self.status_bar.showMessage("Update downloaded. Installing and restarting...")
+        apply_update_and_restart(setup_path)
         QApplication.quit()
 
     def _on_update_download_failed(self, err: str):
