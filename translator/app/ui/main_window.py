@@ -486,6 +486,7 @@ class MainWindow(QMainWindow):
         self.btn_update.clicked.connect(self._on_update_button_clicked)
         self.btn_update.hide()
         self._pending_update: Optional[dict] = None
+        self._update_ready_setup_path: Optional[str] = None
 
         self.btn_settings = QPushButton("Settings")
         self.btn_settings.clicked.connect(self._open_settings)
@@ -659,52 +660,57 @@ class MainWindow(QMainWindow):
         self._update_checker.start()
 
     def _on_update_found(self, info: dict):
+        # Download right away in the background — the user keeps working
+        # uninterrupted (export/transcription progress bar is untouched); the
+        # button itself carries the download progress and only becomes
+        # clickable once the build is staged and ready to install.
         self._pending_update = info
-        self.btn_update.setText(f"🔄 Update {info['tag']} Available")
-        self.btn_update.setToolTip(info.get("notes", "") or f"New version {info['tag']} is available.")
+        self._update_ready_setup_path = None
+        self.btn_update.setText(f"⬇ Update {info['tag']}: 0%")
+        self.btn_update.setToolTip(info.get("notes", "") or f"New version {info['tag']} is downloading in the background.")
+        self.btn_update.setEnabled(False)
         self.btn_update.show()
 
+        token = decrypt_api_key(self.db.get_setting("github_update_token", ""))
+        self._update_downloader = UpdateDownloadWorker(info["asset_id"], info["asset_size"], info["asset_name"], token=token)
+        self._update_downloader.progress.connect(self._on_bg_update_progress)
+        self._update_downloader.finished.connect(self._on_bg_update_ready)
+        self._update_downloader.failed.connect(self._on_bg_update_failed)
+        self._update_downloader.start()
+
+    def _on_bg_update_progress(self, pct: int, msg: str):
+        if self._pending_update:
+            self.btn_update.setText(f"⬇ Update {self._pending_update['tag']}: {pct}%")
+
+    def _on_bg_update_ready(self, setup_path: str):
+        self._update_ready_setup_path = setup_path
+        tag = self._pending_update["tag"] if self._pending_update else ""
+        self.btn_update.setText(f"🔁 Restart to Update {tag}")
+        self.btn_update.setToolTip("Update downloaded and ready — click to restart and apply it.")
+        self.btn_update.setEnabled(True)
+
+    def _on_bg_update_failed(self, err: str):
+        # Silent — a background download hiccup shouldn't interrupt whatever
+        # the user is doing. It'll just retry on the next launch.
+        self.btn_update.hide()
+        self._pending_update = None
+        print(f"[Update] Background download failed: {err}")
+
     def _on_update_button_clicked(self):
-        if not self._pending_update:
-            return
-        info = self._pending_update
+        if not self._update_ready_setup_path:
+            return  # still downloading — button is disabled until ready anyway
+
         reply = QMessageBox.question(
-            self, "Update Available",
-            f"Version {info['tag']} is available (current: v{APP_VERSION}).\n\n"
-            f"{info.get('notes', '')}\n\n"
-            f"Download and install now? The app will restart automatically when done.",
+            self, "Restart to Update",
+            f"Update {self._pending_update['tag']} is ready to install.\n\n"
+            f"Restart Dubify AI now to apply it? Any unsaved project changes should be saved first.",
             QMessageBox.Yes | QMessageBox.No
         )
         if reply != QMessageBox.Yes:
             return
 
-        token = decrypt_api_key(self.db.get_setting("github_update_token", ""))
-        self.btn_update.setEnabled(False)
-        self.progress_bar.show()
-        self.status_bar.showMessage("Downloading update...")
-
-        self._update_downloader = UpdateDownloadWorker(info["asset_id"], info["asset_size"], info["asset_name"], token=token)
-        self._update_downloader.progress.connect(self._on_update_download_progress)
-        self._update_downloader.finished.connect(self._on_update_download_finished)
-        self._update_downloader.failed.connect(self._on_update_download_failed)
-        self._update_downloader.start()
-
-    def _on_update_download_progress(self, pct: int, msg: str):
-        self.progress_bar.setValue(pct)
-        self.status_bar.showMessage(msg)
-
-    def _on_update_download_finished(self, setup_path: str):
-        self.progress_bar.hide()
-        self.btn_update.setEnabled(True)
-        self.status_bar.showMessage("Update downloaded. Installing and restarting...")
-        apply_update_and_restart(setup_path)
+        apply_update_and_restart(self._update_ready_setup_path)
         QApplication.quit()
-
-    def _on_update_download_failed(self, err: str):
-        self.progress_bar.hide()
-        self.btn_update.setEnabled(True)
-        self.status_bar.showMessage("Update failed.")
-        QMessageBox.warning(self, "Update Failed", f"Could not download the update:\n\n{err}")
 
     def _open_style_dialog(self):
         dlg = SubtitleStyleDialog(self.db, self)

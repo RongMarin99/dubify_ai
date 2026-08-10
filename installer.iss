@@ -35,7 +35,7 @@ Name: desktopicon; Description: "Create a desktop shortcut"; GroupDescription: "
 
 [Icons]
 Name: "{group}\Dubify AI"; Filename: "{app}\{#MyAppExeName}"
-Name: "{commondesktop}\Dubify AI"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{userdesktop}\Dubify AI"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch Dubify AI"; Flags: nowait postinstall skipifsilent
