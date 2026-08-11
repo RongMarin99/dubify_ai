@@ -711,10 +711,22 @@ class MainWindow(QMainWindow):
         self._update_checker.start()
 
     def _on_update_found(self, info: dict):
-        # Download right away in the background — the user keeps working
-        # uninterrupted (export/transcription progress bar is untouched); the
-        # button itself carries the download progress and only becomes
-        # clickable once the build is staged and ready to install.
+        if self.db.get_setting("skipped_update_tag", "") == info["tag"]:
+            return  # user explicitly skipped this exact version — stay silent until a newer one ships
+
+        from .update_dialog import UpdateAvailableDialog
+        dlg = UpdateAvailableDialog(info, self)
+        dlg.exec()
+
+        if dlg.result_action == "skip":
+            self.db.set_setting("skipped_update_tag", info["tag"])
+            return
+        if dlg.result_action == "later":
+            return  # will ask again next launch
+
+        # "now" — download in the background so the user keeps working uninterrupted
+        # (export/transcription progress bar is untouched); the header button carries
+        # the download progress and only becomes clickable once staged and ready.
         self._pending_update = info
         self._update_ready_setup_path = None
         self.btn_update.setText(f"⬇ Update {info['tag']}: 0%")
