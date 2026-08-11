@@ -33,28 +33,32 @@ class ExportManager:
         audio_offset_ms: int = -2000,
         aspect_ratio: str = "Original",
         orig_audio_vol_pct: int = 20,
+        mute_all_audio: bool = False,
+        burn_subtitles: bool = True,
         temp_dir: str = "temp"
     ) -> bool:
         os.makedirs(temp_dir, exist_ok=True)
 
-        # 1. Determine Target Dimensions for Subtitle PNG rendering
-        # Match FFmpeg target dimensions logic based on aspect ratio mode
-        if "9:16" in aspect_ratio:
-            target_w, target_h = 1080, 1920
-        elif "16:9" in aspect_ratio:
-            target_w, target_h = 1920, 1080
-        elif "1:1" in aspect_ratio:
-            target_w, target_h = 1080, 1080
-        elif "4:5" in aspect_ratio:
-            target_w, target_h = 1080, 1350
-        else:
-            target_w, target_h = self.ffmpeg_mgr.get_video_dimensions(video_path)
-            
-        # 2. Render pixel-perfect transparent PNG subtitles sequence via Qt QPainter
-        # to guarantee 100% synchronization with the UI preview layout.
-        from .subtitle_renderer import SubtitleRenderer
-        renderer = SubtitleRenderer(style_config, aspect_ratio, target_w, target_h)
-        concat_path = renderer.generate_concat_video(subtitles, os.path.join(temp_dir, "subs_frames"))
+        concat_path = None
+        if burn_subtitles:
+            # 1. Determine Target Dimensions for Subtitle PNG rendering
+            # Match FFmpeg target dimensions logic based on aspect ratio mode
+            if "9:16" in aspect_ratio:
+                target_w, target_h = 1080, 1920
+            elif "16:9" in aspect_ratio:
+                target_w, target_h = 1920, 1080
+            elif "1:1" in aspect_ratio:
+                target_w, target_h = 1080, 1080
+            elif "4:5" in aspect_ratio:
+                target_w, target_h = 1080, 1350
+            else:
+                target_w, target_h = self.ffmpeg_mgr.get_video_dimensions(video_path)
+
+            # 2. Render pixel-perfect transparent PNG subtitles sequence via Qt QPainter
+            # to guarantee 100% synchronization with the UI preview layout.
+            from .subtitle_renderer import SubtitleRenderer
+            renderer = SubtitleRenderer(style_config, aspect_ratio, target_w, target_h)
+            concat_path = renderer.generate_concat_video(subtitles, os.path.join(temp_dir, "subs_frames"))
 
         # 3. Merge generated TTS audio clips into full dubbed audio track
         temp_dubbed_audio = os.path.join(temp_dir, "merged_dubbed_track.wav")
@@ -71,5 +75,6 @@ class ExportManager:
             blur_config=blur_config,
             subtitles=subtitles,
             aspect_ratio=aspect_ratio,
-            orig_audio_vol_pct=orig_audio_vol_pct
+            orig_audio_vol_pct=orig_audio_vol_pct,
+            mute_all_audio=mute_all_audio
         )

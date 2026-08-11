@@ -1,4 +1,4 @@
-APP_VERSION = "1.4.29"
+APP_VERSION = "1.4.30"
 
 # Private GitHub repo that hosts release builds (zip of the PyInstaller dist
 # folder, attached as a release asset) — update checks read/download through

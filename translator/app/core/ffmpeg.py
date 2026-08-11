@@ -228,7 +228,8 @@ class FFmpegManager:
         blur_config: Optional[Dict[str, Any]] = None,
         subtitles: Optional[List[SubtitleItem]] = None,
         aspect_ratio: str = "Original",
-        orig_audio_vol_pct: int = 20
+        orig_audio_vol_pct: int = 20,
+        mute_all_audio: bool = False
     ) -> bool:
         """Burn subtitles (via concat image sequence), logo overlay, blur mask, aspect ratio, and dynamic original audio volume into output video."""
         cmd = [self.ffmpeg_path, "-y"]
@@ -374,7 +375,6 @@ class FFmpegManager:
             filter_complex_parts.append(f"{cur_v_label}copy[vout]")
 
         # STEP 5: Audio Filtering & Mixing (Boosted Dubbed TTS Speech + Speech Ducking)
-        mute_all_audio = export_kwargs.get("mute_all_audio", False)
         if mute_all_audio:
             vol_filter = "aformat=sample_rates=44100:channel_layouts=stereo,volume=0.0"
         else:

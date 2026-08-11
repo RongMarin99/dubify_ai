@@ -97,6 +97,7 @@ class VideoOverlayCanvas(QWidget):
         # Active Subtitle Properties
         self.sub_text: str = ""
         self.is_sub_visible: bool = True
+        self.playback_subtitle_enabled: bool = False  # subtitles are opt-in on preview; off by default
         self.is_sub_selected: bool = False
         self.active_sub_id: Optional[int] = None
 
@@ -351,9 +352,24 @@ class VideoOverlayCanvas(QWidget):
             "enabled": self.logo_enabled
         }
 
+    def set_playback_subtitle_enabled(self, enabled: bool):
+        self.playback_subtitle_enabled = enabled
+        if not enabled and self.is_sub_visible:
+            self.sub_text = ""
+            self.active_sub_id = None
+            self.is_sub_visible = False
+            self.update()
+
     def update_playback_position(self, current_ms: int, subtitles: List[SubtitleItem]):
         """Real-time synchronization loop: find active subtitle at current_ms and keep Z-index on top."""
         self.raise_()  # Maintain top Z-index layer over QVideoWidget playback stream
+        if not self.playback_subtitle_enabled:
+            if self.is_sub_visible:
+                self.is_sub_visible = False
+                self.sub_text = ""
+                self.active_sub_id = None
+                self.update()
+            return
         if not subtitles or not self.video_has_loaded:
             if self.is_sub_visible:
                 self.is_sub_visible = False

@@ -95,8 +95,12 @@ class VoxCPM2KhmerRunner:
                 inference_timesteps=6,
             )
             sf.write(output_file, wav, self._model.tts_model.sample_rate)
-            return os.path.exists(output_file) and os.path.getsize(output_file) > 0
-        except Exception:
+            if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+                return True
+            self._failure_reason = "generate() ran but produced no/empty audio file"
+            return False
+        except Exception as e:
+            self._failure_reason = str(e)
             return False
 
 
@@ -138,6 +142,7 @@ class CosyVoiceDirectLocalRunner:
 class TTSWorker(QThread):
     progress = Signal(int, str)  # progress %, status msg
     finished = Signal(list)
+    warnings = Signal(list)  # human-readable messages for lines that fell back to silence or produced no audio at all
     failed = Signal(str)
 
     def __init__(
@@ -154,6 +159,7 @@ class TTSWorker(QThread):
         self.engine = engine
         self.cosyvoice_url = cosyvoice_url.rstrip("/")
         self.voice_map = voice_map or VOICE_PROFILES
+        self._last_error = ""
         os.makedirs(self.output_dir, exist_ok=True)
 
     def run(self):
@@ -164,6 +170,7 @@ class TTSWorker(QThread):
                 return
 
             updated_subs = []
+            line_warnings = []
             for idx, item in enumerate(self.subtitles):
                 text_to_speak = item.tgt_text.strip() or item.src_text.strip()
                 if not text_to_speak:
@@ -177,8 +184,14 @@ class TTSWorker(QThread):
                 audio_hash = hashlib.md5(f"{self.engine}_{item.voice}_{text_to_speak}".encode('utf-8')).hexdigest()
                 out_path = os.path.join(self.output_dir, f"tts_{item.id}_{audio_hash[:8]}.mp3")
 
+                # A 0-byte leftover from a previous interrupted run would otherwise look
+                # "already generated" and get skipped forever — treat it as missing.
+                if os.path.exists(out_path) and os.path.getsize(out_path) == 0:
+                    os.remove(out_path)
+
                 if not os.path.exists(out_path):
                     success = False
+                    fail_reasons = []
 
                     # 1. sumnim/VoxCPM2-Khmer — real diffusion TTS, most realistic Khmer
                     if "VoxCPM2" in self.engine:
@@ -186,6 +199,7 @@ class TTSWorker(QThread):
                         success = runner.generate(text_to_speak, role_config, out_path)
                         if not success:
                             reason = runner._failure_reason or "No CUDA GPU / Model missing"
+                            fail_reasons.append(f"VoxCPM2: {reason}")
                             self.progress.emit(
                                 int((idx) / total * 100),
                                 f"VoxCPM2 unavailable ({reason[:35]}) — Auto falling back to Edge-TTS..."
@@ -195,10 +209,13 @@ class TTSWorker(QThread):
                     if not success and ("CosyVoice" in self.engine or "Voxc" in self.engine):
                         runner = CosyVoiceDirectLocalRunner.get_instance()
                         success = runner.generate(text_to_speak, item.voice, out_path)
-
-                        # 2b. Local HTTP CosyVoice 2 API fallback
                         if not success:
+                            fail_reasons.append("CosyVoice2 local model unavailable")
+
+                            # 2b. Local HTTP CosyVoice 2 API fallback
                             success = self._generate_cosyvoice2_sync(text_to_speak, item.voice, out_path)
+                            if not success:
+                                fail_reasons.append(f"CosyVoice2 HTTP API: {self._last_error or 'unreachable'}")
 
                     # 3. Fallback to Enhanced Edge-TTS with Pitch & Rate tuning
                     if not success:
@@ -209,18 +226,35 @@ class TTSWorker(QThread):
                             pitch=role_config.get("pitch", "+0Hz"),
                             output_file=out_path
                         )
+                        if not success:
+                            fail_reasons.append(f"Edge-TTS: {self._last_error or 'request failed (check internet connection)'}")
 
                     if not success:
                         self._create_silent_wav(out_path, duration_ms=max(1000, item.end_ms - item.start_ms))
+                        if os.path.exists(out_path):
+                            preview = text_to_speak[:40] + ("..." if len(text_to_speak) > 40 else "")
+                            line_warnings.append(
+                                f"Line {item.id} \"{preview}\": all TTS engines failed ({'; '.join(fail_reasons) or 'unknown error'}) — using silence instead."
+                            )
+                        else:
+                            line_warnings.append(
+                                f"Line {item.id}: TTS AND silent-audio fallback both failed ({self._last_error or 'unknown error'}) — this line will have NO audio in the export."
+                            )
 
-                item.audio_path = out_path
-                item.status = "Audio Generated"
+                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    item.audio_path = out_path
+                    item.status = "Audio Generated"
+                else:
+                    item.audio_path = ""
+                    item.status = "Audio Failed"
                 updated_subs.append(item)
 
                 pct = int((idx + 1) / total * 100)
                 self.progress.emit(pct, f"Generated voice {idx+1}/{total}...")
 
             self.progress.emit(100, "TTS Voice Generation Complete!")
+            if line_warnings:
+                self.warnings.emit(line_warnings)
             self.finished.emit(updated_subs)
 
         except Exception as e:
@@ -240,8 +274,9 @@ class TTSWorker(QThread):
                 with open(output_file, "wb") as f:
                     f.write(res.content)
                 return True
-        except Exception:
-            pass
+            self._last_error = f"HTTP {res.status_code}"
+        except Exception as e:
+            self._last_error = str(e)
         return False
 
     def _generate_edge_tts_sync(self, text: str, voice: str, rate: str, pitch: str, output_file: str) -> bool:
@@ -256,8 +291,12 @@ class TTSWorker(QThread):
             asyncio.set_event_loop(loop)
             loop.run_until_complete(_main())
             loop.close()
-            return os.path.exists(output_file) and os.path.getsize(output_file) > 0
-        except Exception:
+            if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+                return True
+            self._last_error = "produced no/empty audio file"
+            return False
+        except Exception as e:
+            self._last_error = str(e)
             return False
 
     def _create_silent_wav(self, output_file: str, duration_ms: int = 1000):
@@ -272,5 +311,5 @@ class TTSWorker(QThread):
                 wf.setsampwidth(sampwidth)
                 wf.setframerate(framerate)
                 wf.writeframes(b'\x00' * (nframes * nchannels * sampwidth))
-        except Exception:
-            pass
+        except Exception as e:
+            self._last_error = f"silent WAV write failed: {e}"

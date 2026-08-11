@@ -152,7 +152,6 @@ class TimelineCanvas(QWidget):
 
 class TimelineWidget(QWidget):
     seek_requested = Signal(int)
-    generate_transcript_clicked = Signal()  # engine/model now comes from Settings
     translate_clicked = Signal()
     generate_audio_clicked = Signal()
     verify_audio_clicked = Signal()
@@ -175,12 +174,6 @@ class TimelineWidget(QWidget):
         self.lbl_timecode = QLabel("00:00 / 00:00")
         self.lbl_timecode.setStyleSheet("color: #dcdde1; font-family: monospace;")
 
-        # STT engine/model is configured once in Settings > Transcript (STT) — no
-        # picker here, just click and go. Button shows a loading state while running.
-        self.btn_gen_transcript = QPushButton("🎙️ Generate Transcript")
-        self.btn_gen_transcript.setObjectName("ActionBtn")
-        self.btn_gen_transcript.setToolTip("Uses the STT engine/model set in Settings > Transcript (STT).")
-
         # Audio Timing Offset Dropdown
         self.combo_lead_offset = QComboBox()
         self.combo_lead_offset.addItems([
@@ -194,6 +187,7 @@ class TimelineWidget(QWidget):
 
         self.btn_translate = QPushButton("Translate")
         self.btn_translate.setObjectName("PrimaryBtn")
+        self.btn_translate.setToolTip("Generates the transcript first (if missing), then translates to the selected language.")
 
         self.btn_audio = QPushButton("Generate Audio")
 
@@ -215,8 +209,6 @@ class TimelineWidget(QWidget):
         tb_layout.addWidget(self.lbl_title)
         tb_layout.addWidget(self.lbl_timecode)
         tb_layout.addSpacing(10)
-        tb_layout.addWidget(self.btn_gen_transcript)
-        tb_layout.addSpacing(10)
         tb_layout.addWidget(self.combo_lang)
         tb_layout.addWidget(self.btn_translate)
         tb_layout.addWidget(self.combo_lead_offset)
@@ -234,7 +226,6 @@ class TimelineWidget(QWidget):
         layout.addWidget(self.canvas)
 
         # Connect Signals
-        self.btn_gen_transcript.clicked.connect(self.generate_transcript_clicked.emit)
         self.btn_translate.clicked.connect(self.translate_clicked)
         self.btn_audio.clicked.connect(self.generate_audio_clicked)
         self.btn_verify_audio.clicked.connect(self.verify_audio_clicked)
@@ -247,11 +238,19 @@ class TimelineWidget(QWidget):
 
     def set_transcribing(self, active: bool, status: str = ""):
         if active:
-            self.btn_gen_transcript.setEnabled(False)
-            self.btn_gen_transcript.setText(f"⏳ {status or 'Transcribing...'}")
+            self.btn_translate.setEnabled(False)
+            self.btn_translate.setText(f"⏳ {status or 'Transcribing...'}")
         else:
-            self.btn_gen_transcript.setEnabled(True)
-            self.btn_gen_transcript.setText("🎙️ Generate Transcript")
+            self.btn_translate.setEnabled(True)
+            self.btn_translate.setText("Translate")
+
+    def set_translating(self, active: bool, status: str = ""):
+        if active:
+            self.btn_translate.setEnabled(False)
+            self.btn_translate.setText(f"⏳ {status or 'Translating...'}")
+        else:
+            self.btn_translate.setEnabled(True)
+            self.btn_translate.setText("Translate")
 
     def set_verifying(self, active: bool, status: str = ""):
         if active:

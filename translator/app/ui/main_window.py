@@ -39,6 +39,7 @@ class VideoPlayerWidget(QFrame):
         self.setObjectName("VideoPreviewPanel")
         self.setAcceptDrops(True)
         self.video_path: str = ""
+        self._poster_frame_done: bool = True  # one-shot guard so the play/pause poster-frame nudge fires only once per video load
 
         self._init_ui()
 
@@ -61,7 +62,7 @@ class VideoPlayerWidget(QFrame):
         header_bar.addWidget(lbl_header)
         header_bar.addWidget(self.lbl_video_name)
         header_bar.addStretch()
-        header_bar.addWidget(self.btn_change_video)
+        self._header_toolbar_layout = header_bar
 
         layout.addLayout(header_bar)
 
@@ -109,8 +110,9 @@ class VideoPlayerWidget(QFrame):
         ctrl_layout = QHBoxLayout()
 
         self.btn_play = QPushButton("▶ Play")
+        self.btn_play.setObjectName("PrimaryBtn")
         self.btn_stop = QPushButton("■ Stop")
-        
+
         self.btn_loop = QPushButton("🔁")
         self.btn_loop.setCheckable(True)
         self.btn_loop.setFixedWidth(32)
@@ -119,6 +121,10 @@ class VideoPlayerWidget(QFrame):
         self.slider_vol.setRange(0, 100)
         self.slider_vol.setValue(80)
         self.slider_vol.setFixedWidth(80)
+
+        # Seek Bar (position scrubber) — sits between the video and the transport controls
+        self.slider_seek = QSlider(Qt.Horizontal)
+        self.slider_seek.setRange(0, 0)
 
         self.btn_logo = QPushButton("🖼️ Logo")
         self.btn_add_blur = QPushButton("🌫️ Add Blur")
@@ -138,18 +144,24 @@ class VideoPlayerWidget(QFrame):
             "Original (Keep)", "9:16 (Portrait)", "16:9 (Landscape)", "1:1 (Square)", "4:5 (Vertical)"
         ])
 
+        # Subtitle preview is opt-in: unchecked by default so a fresh video plays clean with no captions.
+        self.chk_show_subtitle = QCheckBox("💬 Show Subtitle")
+        self.chk_show_subtitle.setChecked(False)
+
         self.combo_orig_vol = QComboBox()
         self.combo_orig_vol.addItems([
             "🔊 Orig Vol: 0%", "🔊 Orig Vol: 10%", "🔊 Orig Vol: 20%", "🔊 Orig Vol: 30%",
             "🔊 Orig Vol: 40%", "🔊 Orig Vol: 50%", "🔊 Orig Vol: 75%", "🔊 Orig Vol: 100%"
         ])
-        self.combo_orig_vol.setCurrentText("🔊 Orig Vol: 20%")
+        self.combo_orig_vol.setCurrentText("🔊 Orig Vol: 0%")
 
         self.chk_mute_all = QCheckBox("Mute All Audio")
         self.chk_mute_all.setToolTip("Completely mute all original audio (including background noise and sound effects) everywhere.")
 
         self.lbl_current_time = QLabel("00:00.00")
+        self.lbl_current_time.setStyleSheet("color: #8c89b4; font-size: 11px;")
         self.lbl_duration = QLabel("00:00.00")
+        self.lbl_duration.setStyleSheet("color: #8c89b4; font-size: 11px;")
 
         def _divider():
             line = QFrame()
@@ -157,23 +169,33 @@ class VideoPlayerWidget(QFrame):
             line.setStyleSheet("color: #2a2840;")
             return line
 
+        # Header icon toolbar (upload / overlay tools) — kept above the video, out of the transport bar
+        self._header_toolbar_layout.addWidget(self.btn_logo)
+        self._header_toolbar_layout.addWidget(self.btn_add_blur)
+        self._header_toolbar_layout.addWidget(self.btn_add_sub)
+        self._header_toolbar_layout.addWidget(self.btn_duck_bg)
+        self._header_toolbar_layout.addWidget(self.combo_orig_vol)
+        self._header_toolbar_layout.addWidget(self.chk_mute_all)
+        self._header_toolbar_layout.addWidget(self.btn_change_video)
+
+        # Seek Bar Row — current time | scrubber | duration
+        seek_layout = QHBoxLayout()
+        seek_layout.addWidget(self.lbl_current_time)
+        seek_layout.addWidget(self.slider_seek, stretch=1)
+        seek_layout.addWidget(self.lbl_duration)
+        layout.addLayout(seek_layout)
+
+        # Transport Bar — Play / Stop / Loop / Volume / Aspect Ratio
         ctrl_layout.addWidget(self.btn_play)
         ctrl_layout.addWidget(self.btn_stop)
         ctrl_layout.addWidget(self.btn_loop)
+        ctrl_layout.addWidget(_divider())
+        ctrl_layout.addWidget(QLabel("🔊"))
         ctrl_layout.addWidget(self.slider_vol)
         ctrl_layout.addWidget(_divider())
-        ctrl_layout.addWidget(self.btn_logo)
-        ctrl_layout.addWidget(self.btn_add_blur)
-        ctrl_layout.addWidget(self.btn_add_sub)
-        ctrl_layout.addWidget(_divider())
-        ctrl_layout.addWidget(self.btn_duck_bg)
         ctrl_layout.addWidget(self.combo_ratio)
-        ctrl_layout.addWidget(self.combo_orig_vol)
-        ctrl_layout.addWidget(self.chk_mute_all)
+        ctrl_layout.addWidget(self.chk_show_subtitle)
         ctrl_layout.addStretch()
-        ctrl_layout.addWidget(self.lbl_current_time)
-        ctrl_layout.addWidget(QLabel("/"))
-        ctrl_layout.addWidget(self.lbl_duration)
 
         layout.addLayout(ctrl_layout)
 
@@ -182,6 +204,8 @@ class VideoPlayerWidget(QFrame):
         self.btn_stop.clicked.connect(self.stop)
         self.btn_change_video.clicked.connect(self._on_upload_click_from_canvas)
         self.slider_vol.valueChanged.connect(self.set_volume)
+        self.slider_seek.sliderMoved.connect(self.seek)
+        self.chk_show_subtitle.toggled.connect(self._on_show_subtitle_toggled)
         self.btn_logo.clicked.connect(self._on_select_logo)
         self.btn_add_blur.clicked.connect(self._on_add_blur)
         self.btn_add_sub.clicked.connect(self._on_add_subtitle)
@@ -190,9 +214,14 @@ class VideoPlayerWidget(QFrame):
         self.overlay_canvas.video_dropped.connect(self.load_video)
         self.player.positionChanged.connect(self._on_position_changed)
         self.player.durationChanged.connect(self._on_duration_changed)
+        self.player.mediaStatusChanged.connect(self._on_media_status_changed)
 
     def _on_aspect_ratio_changed(self, text: str):
         self.overlay_canvas.set_aspect_ratio_mode(text)
+
+    def _on_show_subtitle_toggled(self, checked: bool):
+        self.overlay_canvas.set_playback_subtitle_enabled(checked)
+        self.overlay_canvas.update_playback_position(self.player.position(), self.subtitles_ref)
 
     def set_subtitles(self, subtitles: List[SubtitleItem]):
         self.subtitles_ref = subtitles
@@ -339,6 +368,7 @@ class VideoPlayerWidget(QFrame):
         self.overlay_canvas.set_video_loaded(True)
         self.overlay_canvas.raise_()
         self.overlay_canvas.update()
+        self._poster_frame_done = False
         self.player.setSource(QUrl.fromLocalFile(video_path))
         self.video_loaded.emit(video_path)
 
@@ -370,6 +400,8 @@ class VideoPlayerWidget(QFrame):
     def _on_position_changed(self, position: int):
         tc = SubtitleItem.ms_to_timecode(position)[:8]
         self.lbl_current_time.setText(tc)
+        if not self.slider_seek.isSliderDown():
+            self.slider_seek.setValue(position)
 
         # Check if position is currently inside a speech dialogue interval
         is_speech_interval = False
@@ -382,7 +414,7 @@ class VideoPlayerWidget(QFrame):
         # Dynamic Original Audio Volume Control (0% to 100%)
         import re
         vol_match = re.search(r'\d+', self.combo_orig_vol.currentText())
-        vol_pct = int(vol_match.group()) if vol_match else 20
+        vol_pct = int(vol_match.group()) if vol_match else 0
         
         if hasattr(self, 'chk_mute_all') and self.chk_mute_all.isChecked():
             target_vol = 0.0
@@ -420,6 +452,24 @@ class VideoPlayerWidget(QFrame):
     def _on_duration_changed(self, duration: int):
         tc = SubtitleItem.ms_to_timecode(duration)[:8]
         self.lbl_duration.setText(tc)
+        self.slider_seek.setRange(0, duration)
+
+    def _on_media_status_changed(self, status):
+        # QGraphicsVideoItem paints nothing until a frame is actually decoded, so a
+        # freshly loaded video looks blank. Kick off playback and let it run briefly
+        # so the decoder pushes a frame, then pause — play()+pause() back-to-back is
+        # too fast, the backend is async and never gets a frame out before pausing.
+        if status == QMediaPlayer.MediaStatus.LoadedMedia and not self._poster_frame_done:
+            self._poster_frame_done = True
+            self.player.play()
+            QTimer.singleShot(150, self._pause_after_first_frame)
+
+    def _pause_after_first_frame(self):
+        self.player.pause()
+        self.player.setPosition(0)
+        self.btn_play.setText("▶ Play")
+        self.video_scene.update()
+        self.video_view.viewport().update()
 
 
 class MainWindow(QMainWindow):
@@ -440,22 +490,14 @@ class MainWindow(QMainWindow):
         self.current_project = ProjectModel()
         self.subtitles: List[SubtitleItem] = []
         self._source_lang_code: str = "zh"  # updated by _on_stt_language_detected after each transcription
+        self._auto_translate_pending: bool = False  # set when "Translate" ran transcript first, so it can chain into translation
 
         self._init_ui()
         self._check_for_updates()
 
     def _fit_to_screen(self, preferred_w: int, preferred_h: int):
-        """Size/center window to fit whatever screen it's on, and maximize
-        on screens smaller than the preferred size so the video preview
-        never gets clipped on small-resolution PCs."""
-        screen = self.screen() or QApplication.primaryScreen()
-        avail = screen.availableGeometry()
-        w = min(preferred_w, avail.width())
-        h = min(preferred_h, avail.height())
-        self.resize(w, h)
-        self.move(avail.x() + (avail.width() - w) // 2, avail.y() + (avail.height() - h) // 2)
-        if avail.width() < preferred_w or avail.height() < preferred_h:
-            self.showMaximized()
+        """Always launch maximized so the video preview and editor get full screen real estate."""
+        self.showMaximized()
 
     def _init_ui(self):
         main_widget = QWidget()
@@ -592,7 +634,6 @@ class MainWindow(QMainWindow):
         self.video_player.overlay_canvas.delete_sub_requested.connect(self._delete_active_subtitle)
         self.video_player.overlay_canvas.subtitle_font_size_changed.connect(self._on_subtitle_font_size_changed)
         self.timeline_widget.seek_requested.connect(self.video_player.seek)
-        self.timeline_widget.generate_transcript_clicked.connect(self._start_transcription)
         self.timeline_widget.translate_clicked.connect(self._start_translation)
         self.timeline_widget.generate_audio_clicked.connect(self._start_tts)
         self.timeline_widget.verify_audio_clicked.connect(self._start_khmer_audio_qa)
@@ -843,6 +884,7 @@ class MainWindow(QMainWindow):
 
     def _on_stt_failed(self, err_msg: str):
         self.timeline_widget.set_transcribing(False)
+        self._auto_translate_pending = False
         self._on_worker_failed(err_msg)
 
     def _on_stt_language_detected(self, lang_code: str):
@@ -867,12 +909,28 @@ class MainWindow(QMainWindow):
         self.timeline_widget.load_subtitles(self.subtitles)
         self.video_player.set_subtitles(self.subtitles)
 
+        if self._auto_translate_pending:
+            self._auto_translate_pending = False
+            self._start_translation()
+
     def _start_translation(self):
         if not self.subtitles:
-            QMessageBox.warning(self, "Warning", "No subtitles loaded to translate.")
+            # User-friendly one-click flow: clicking "Translate" with no transcript yet
+            # runs transcription first, then auto-chains into translation on success.
+            if not self.current_project.video_path:
+                QMessageBox.warning(self, "Warning", "Please load a video first.")
+                return
+            wav_path = self.current_project.audio_path or os.path.join("temp", "extracted_audio.wav")
+            if not os.path.exists(wav_path):
+                QMessageBox.warning(self, "Warning", "Audio is still extracting from video. Please wait a moment.")
+                return
+            self._auto_translate_pending = True
+            self.status_bar.showMessage("No transcript yet — generating transcript first, then translating automatically...")
+            self._start_transcription()
             return
 
         self.progress_bar.show()
+        self.timeline_widget.set_translating(True)
         lang_names = {"zh": "Chinese", "en": "English", "ja": "Japanese", "ko": "Korean"}
         source_lang = lang_names.get(self._source_lang_code, self._source_lang_code)
         self.trans_worker = TranslationWorker(
@@ -888,17 +946,22 @@ class MainWindow(QMainWindow):
         self.trans_worker.progress.connect(self._update_progress)
         self.trans_worker.line_translated.connect(self.subtitle_editor.update_single_translation)
         self.trans_worker.finished.connect(self._on_translation_finished)
-        self.trans_worker.failed.connect(self._on_worker_failed)
+        self.trans_worker.failed.connect(self._on_translation_failed)
         self.trans_worker.start()
 
     def _on_translation_finished(self, translated_subs: List[SubtitleItem]):
         self.progress_bar.hide()
+        self.timeline_widget.set_translating(False)
         self.status_bar.showMessage("AI Context Translation completed.")
         self.subtitles = translated_subs
         self.subtitle_editor.load_subtitles(self.subtitles)
         self.timeline_widget.load_subtitles(self.subtitles)
         self.video_player.set_subtitles(self.subtitles)
         self.video_player.overlay_canvas.update_playback_position(self.video_player.player.position(), self.subtitles)
+
+    def _on_translation_failed(self, err_msg: str):
+        self.timeline_widget.set_translating(False)
+        self._on_worker_failed(err_msg)
 
     def _start_tts(self):
         if not self.subtitles:
@@ -914,6 +977,7 @@ class MainWindow(QMainWindow):
         )
         self.tts_worker.progress.connect(self._update_progress)
         self.tts_worker.finished.connect(self._on_tts_finished)
+        self.tts_worker.warnings.connect(self._on_tts_warnings)
         self.tts_worker.failed.connect(self._on_worker_failed)
         self.tts_worker.start()
 
@@ -924,6 +988,16 @@ class MainWindow(QMainWindow):
         self.subtitle_editor.load_subtitles(self.subtitles)
         self.timeline_widget.load_subtitles(self.subtitles)
         self.video_player.set_subtitles(self.subtitles)
+
+    def _on_tts_warnings(self, warnings: List[str]):
+        # Surfaces exactly why specific lines have no/silent dubbed audio — every TTS
+        # engine failure used to be swallowed silently, making missing audio in the
+        # exported video impossible to diagnose.
+        preview = "\n".join(f"• {w}" for w in warnings[:15])
+        if len(warnings) > 15:
+            preview += f"\n...and {len(warnings) - 15} more."
+        self.status_bar.showMessage(f"TTS completed with {len(warnings)} line(s) needing attention — see popup for details.")
+        QMessageBox.warning(self, "TTS Audio Warnings", f"{len(warnings)} line(s) had audio generation issues:\n\n{preview}")
 
     def _start_khmer_audio_qa(self):
         if not self.subtitles:
@@ -1015,6 +1089,9 @@ class MainWindow(QMainWindow):
             duration_ms=self.video_player.player.duration(),
             parent=self
         )
+        # Default the export dialog's burn-subtitles toggle to match what's currently
+        # shown in the preview, so "no subtitles ticked" doesn't silently burn them anyway.
+        settings_dlg.chk_burn_subtitles.setChecked(self.video_player.chk_show_subtitle.isChecked())
         if settings_dlg.exec() != QDialog.Accepted:
             return
 
@@ -1042,7 +1119,7 @@ class MainWindow(QMainWindow):
         elif "+2.0s" in lead_text: offset_ms = 2000
 
         vol_match = re.search(r'\d+', self.video_player.combo_orig_vol.currentText())
-        orig_vol_pct = int(vol_match.group()) if vol_match else 20
+        orig_vol_pct = int(vol_match.group()) if vol_match else 0
 
         export_args = {
             "video_path": self.current_project.video_path,
@@ -1052,10 +1129,11 @@ class MainWindow(QMainWindow):
             "logo_config": logo_cfg,
             "blur_config": blur_cfg,
             "mute_original_audio": self.video_player.btn_duck_bg.isChecked(),
-            "mute_all_audio": self.chk_mute_all.isChecked(),
+            "mute_all_audio": self.video_player.chk_mute_all.isChecked(),
             "audio_offset_ms": offset_ms,
             "aspect_ratio": canvas.aspect_ratio_mode,
-            "orig_audio_vol_pct": orig_vol_pct
+            "orig_audio_vol_pct": orig_vol_pct,
+            "burn_subtitles": cfg.get("burn_subtitles", True)
         }
 
         self.export_render_worker = ExportWorker(self.export_mgr, export_args)
