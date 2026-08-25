@@ -590,6 +590,8 @@ class SettingsDialog(QDialog):
             return "deepseek-chat"
         elif "Llama-3" in label:
             return "llama3"
+        elif "Local NLLB" in label:
+            return ""  # LocalNLLBProvider auto-resolves its own model path
         return label
 
     @staticmethod
@@ -652,7 +654,8 @@ class SettingsDialog(QDialog):
             "Gemini 2.5 Flash (Faster, Slightly Less Natural)",
             "OpenAI GPT-4o",
             "DeepSeek R1 / V3",
-            "Ollama Local Llama-3"
+            "Ollama Local Llama-3",
+            "Local NLLB (Offline, English → Khmer)"
         ])
         r1.addWidget(self.combo_trans_engine, 1)
         tl.addLayout(r1)
@@ -1359,6 +1362,8 @@ class SettingsDialog(QDialog):
             self.db.set_setting("ai_provider", "OpenAI")
         elif "DeepSeek" in selected_trans:
             self.db.set_setting("ai_provider", "DeepSeek")
+        elif "Local NLLB" in selected_trans:
+            self.db.set_setting("ai_provider", "LocalNLLB")
         else:
             self.db.set_setting("ai_provider", "Ollama")
 

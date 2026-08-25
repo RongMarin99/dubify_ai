@@ -9,6 +9,11 @@ faster-whisper>=1.0.0
 python-dateutil>=2.8.2
 transformers>=4.30.0
 torch>=2.5.0
+sentencepiece>=0.2.0
+# Only needed to run translator/scripts/finetune_nllb_km.py (fine-tuning the
+# offline English->Khmer NLLB model) — not required at app runtime.
+datasets>=2.19.0
+accelerate>=0.30.0
 # Optional: sumnim/VoxCPM2-Khmer TTS voice (Settings > Voice). Needs a CUDA >=12.0 GPU
 # with ~8GB VRAM in practice — without it, generation just falls back to Edge-TTS.
 voxcpm

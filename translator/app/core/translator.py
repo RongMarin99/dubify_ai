@@ -6,6 +6,7 @@ from ..ai.gemini import GeminiProvider
 from ..ai.openai import OpenAIProvider
 from ..ai.ollama import OllamaProvider
 from ..ai.deepl import GoogleTranslateProvider
+from ..ai.local_mt import LocalNLLBProvider
 from ..core.cache import CacheManager
 
 class TranslationWorker(QThread):
@@ -80,8 +81,13 @@ class TranslationWorker(QThread):
 
                     # Smart AI Fallback check if Gemini key rotation failed
                     if smart_ai and (not khmer_translation or "No available Gemini API key" in khmer_translation):
-                        # Switch automatically to local AI (Ollama / Local LLM)
-                        fallback = OllamaProvider(model_name="qwen2.5:7b")
+                        # English source has a dedicated offline NLLB model (no
+                        # network, no rate limit) — prefer it over the generic
+                        # Ollama LLM fallback when the source language matches.
+                        if self.source_lang == "English":
+                            fallback = LocalNLLBProvider()
+                        else:
+                            fallback = OllamaProvider(model_name="qwen2.5:7b")
                         khmer_translation = fallback.translate(
                             text=item.src_text,
                             source_lang=self.source_lang,
@@ -122,5 +128,7 @@ class TranslationWorker(QThread):
             return OpenAIProvider(api_key=self.api_key, model_name=self.model_name)
         elif self.engine_name in ["Ollama", "Qwen", "Local LLM"]:
             return OllamaProvider(model_name=self.model_name)
+        elif self.engine_name in ["LocalNLLB", "Local NLLB"]:
+            return LocalNLLBProvider(model_path=self.model_name or None)
         else:
             return GoogleTranslateProvider()
