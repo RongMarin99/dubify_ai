@@ -79,16 +79,18 @@ class TranslationWorker(QThread):
                         context_next=next_context
                     )
 
-                    # Smart AI Fallback check if Gemini key rotation failed
-                    if smart_ai and (not khmer_translation or "No available Gemini API key" in khmer_translation):
-                        # English source has a dedicated offline NLLB model (no
-                        # network, no rate limit) — prefer it over the generic
-                        # Ollama LLM fallback when the source language matches.
-                        if self.source_lang == "English":
-                            fallback = LocalNLLBProvider()
-                        else:
-                            fallback = OllamaProvider(model_name="qwen2.5:7b")
-                        khmer_translation = fallback.translate(
+                    # Smart AI Fallback check if Gemini / primary engine hit 429 Rate Limit or failed
+                    if smart_ai and (
+                        not khmer_translation
+                        or "No available Gemini API key" in khmer_translation
+                        or "Error 429" in khmer_translation
+                        or "Quota" in khmer_translation
+                        or "Rate Limit" in khmer_translation
+                        or khmer_translation.startswith("[")
+                    ):
+                        # Try offline Local NLLB first (no network, no rate limit, supports EN/ZH/JA/KO -> Khmer)
+                        fallback = LocalNLLBProvider()
+                        fb_res = fallback.translate(
                             text=item.src_text,
                             source_lang=self.source_lang,
                             target_lang="Khmer",
@@ -96,6 +98,21 @@ class TranslationWorker(QThread):
                             context_prev=prev_context,
                             context_next=next_context
                         )
+                        if fb_res and not fb_res.startswith("[Local NLLB Error"):
+                            khmer_translation = fb_res
+                        else:
+                            # If NLLB fails or isn't available, attempt local Ollama fallback
+                            ollama_fb = OllamaProvider(model_name="qwen2.5:7b")
+                            ollama_res = ollama_fb.translate(
+                                text=item.src_text,
+                                source_lang=self.source_lang,
+                                target_lang="Khmer",
+                                prompt_template=self.custom_prompt,
+                                context_prev=prev_context,
+                                context_next=next_context
+                            )
+                            if ollama_res and not ollama_res.startswith("[Ollama"):
+                                khmer_translation = ollama_res
 
                     item.tgt_text = khmer_translation
                     item.status = "Translated"

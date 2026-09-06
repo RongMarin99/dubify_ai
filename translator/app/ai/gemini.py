@@ -305,7 +305,7 @@ class GeminiProvider(BaseAIProvider):
 
         # Phase 1: Context & Relationship Aware Localization Pass
         raw_translation = self._call_gemini_api_with_rotation(system_prompt, user_content, temperature)
-        if not raw_translation or raw_translation.startswith("Error") or raw_translation.startswith("API Exception") or raw_translation == "No available Gemini API key.":
+        if not raw_translation or raw_translation.startswith("Error") or raw_translation.startswith("API Exception") or "No available Gemini API key" in raw_translation:
             return self.fallback_provider.translate(text, source_lang, target_lang)
 
         cleaned_khmer = clean_khmer_translation(raw_translation)

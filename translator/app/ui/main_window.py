@@ -1155,9 +1155,11 @@ class MainWindow(QMainWindow):
         self.export_render_worker.start()
 
     def closeEvent(self, event):
-        for attr in ["whisper_worker", "audio_extract_worker", "translator_worker", "tts_worker"]:
+        for attr in ["whisper_worker", "audio_extract_worker", "trans_worker", "tts_worker", "export_render_worker"]:
             worker = getattr(self, attr, None)
             if worker and worker.isRunning():
+                worker.requestInterruption()
                 worker.quit()
-                worker.wait(500)
+                if not worker.wait(1000):
+                    worker.terminate()
         event.accept()

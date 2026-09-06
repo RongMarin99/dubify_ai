@@ -54,7 +54,7 @@ class LocalNLLBProvider(BaseAIProvider):
         tokenizer = AutoTokenizer.from_pretrained(self.model_path)
         model = AutoModelForSeq2SeqLM.from_pretrained(
             self.model_path,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            dtype=torch.float16 if device == "cuda" else torch.float32,
         ).to(device)
         model.eval()
 
