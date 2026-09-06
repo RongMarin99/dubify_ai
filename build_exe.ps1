@@ -12,11 +12,15 @@
 $version = (python -c "import sys; sys.path.insert(0, 'translator'); from app.version import APP_VERSION; print(APP_VERSION)").Trim()
 Write-Host "Building Dubify AI v$version..."
 
-pip install --quiet pyinstaller pyinstaller-hooks-contrib
+pip install --quiet setuptools pyinstaller pyinstaller-hooks-contrib
 if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: pip install failed."; exit 1 }
 
-if (Test-Path "build") { Remove-Item "build" -Recurse -Force }
-if (Test-Path "dist") { Remove-Item "dist" -Recurse -Force }
+# Stop any running instances of DubifyAI.exe that might lock files in dist/
+Stop-Process -Name "DubifyAI" -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 500
+
+if (Test-Path "build") { Remove-Item "build" -Recurse -Force -ErrorAction SilentlyContinue }
+if (Test-Path "dist") { Remove-Item "dist" -Recurse -Force -ErrorAction SilentlyContinue }
 
 python -m PyInstaller dubify.spec --noconfirm --clean
 if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: PyInstaller build failed."; exit 1 }
@@ -31,11 +35,11 @@ if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: PyInstaller build failed."; exit 1
 # to python313.dll so Windows treats both names as the same loaded module.
 $internalDir = "dist\DubifyAI\_internal"
 $python3Dll = Join-Path $internalDir "python3.dll"
-$python313Dll = Join-Path $internalDir "python313.dll"
-if ((Test-Path $python3Dll) -and (Test-Path $python313Dll)) {
+$pySpecificDll = Get-ChildItem -Path $internalDir -Filter "python3*.dll" | Where-Object { $_.Name -ne "python3.dll" } | Select-Object -First 1
+if ((Test-Path $python3Dll) -and $pySpecificDll) {
     Remove-Item $python3Dll -Force
-    New-Item -ItemType HardLink -Path $python3Dll -Target $python313Dll | Out-Null
-    Write-Host "Fixed up python3.dll (hardlinked to python313.dll to prevent duplicate-runtime crash)."
+    New-Item -ItemType HardLink -Path $python3Dll -Target $pySpecificDll.FullName | Out-Null
+    Write-Host "Fixed up python3.dll (hardlinked to $($pySpecificDll.Name) to prevent duplicate-runtime crash)."
 }
 
 $isccPath = $null
