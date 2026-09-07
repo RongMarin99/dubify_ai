@@ -695,6 +695,7 @@ class MainWindow(QMainWindow):
 
     def _open_settings(self):
         dlg = SettingsDialog(self.db, self)
+        dlg.update_found.connect(self._on_update_found)
         if dlg.exec():
             self._update_status_bar_badges()
 

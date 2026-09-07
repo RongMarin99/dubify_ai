@@ -155,6 +155,8 @@ class SettingsNavItemWidget(QFrame):
 
 
 class SettingsDialog(QDialog):
+    update_found = Signal(dict)
+
     def __init__(self, db: DatabaseManager, parent=None):
         super().__init__(parent)
         self.db = db
@@ -1253,6 +1255,7 @@ class SettingsDialog(QDialog):
             f"✅ Update available: {info['tag']} ({info['asset_name']}). "
             f"Close Settings and use the Update button in the top bar to install it."
         )
+        self.update_found.emit(info)
 
     def _on_settings_update_none(self):
         self.lbl_update_status.setText(f"You're up to date (v{APP_VERSION}).")
